@@ -7,11 +7,13 @@ use crate::dbs::Transaction;
 use crate::err::Error;
 use crate::sql::array::{array, Array};
 use crate::sql::common::commas;
+use crate::sql::constant::{constant, Constant};
 use crate::sql::datetime::{datetime, Datetime};
 use crate::sql::duration::{duration, Duration};
 use crate::sql::edges::{edges, Edges};
 use crate::sql::error::IResult;
 use crate::sql::expression::{expression, Expression};
+use crate::sql::fmt::Fmt;
 use crate::sql::function::{function, Function};
 use crate::sql::geometry::{geometry, Geometry};
 use crate::sql::id::Id;
@@ -47,7 +49,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::fmt;
+use std::fmt::{self, Display, Formatter};
 use std::iter::FromIterator;
 use std::ops;
 use std::ops::Deref;
@@ -73,9 +75,9 @@ impl IntoIterator for Values {
 	}
 }
 
-impl fmt::Display for Values {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		write!(f, "{}", self.0.iter().map(|ref v| format!("{}", v)).collect::<Vec<_>>().join(", "))
+impl Display for Values {
+	fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+		Display::fmt(&Fmt::comma_separated(&self.0), f)
 	}
 }
 
@@ -117,6 +119,7 @@ pub enum Value {
 	Regex(Regex),
 	Range(Box<Range>),
 	Edges(Box<Edges>),
+	Constant(Constant),
 	Function(Box<Function>),
 	Subquery(Box<Subquery>),
 	Expression(Box<Expression>),
@@ -227,6 +230,12 @@ impl From<Datetime> for Value {
 impl From<Duration> for Value {
 	fn from(v: Duration) -> Self {
 		Value::Duration(v)
+	}
+}
+
+impl From<Constant> for Value {
+	fn from(v: Constant) -> Self {
+		Value::Constant(v)
 	}
 }
 
@@ -398,6 +407,12 @@ impl From<Vec<Value>> for Value {
 	}
 }
 
+impl From<Vec<Number>> for Value {
+	fn from(v: Vec<Number>) -> Self {
+		Value::Array(Array::from(v))
+	}
+}
+
 impl From<Vec<Operation>> for Value {
 	fn from(v: Vec<Operation>) -> Self {
 		Value::Array(Array::from(v))
@@ -515,6 +530,7 @@ impl Value {
 		match self {
 			Value::True => true,
 			Value::False => false,
+			Value::Uuid(_) => true,
 			Value::Thing(_) => true,
 			Value::Geometry(_) => true,
 			Value::Array(v) => !v.is_empty(),
@@ -535,6 +551,14 @@ impl Value {
 		matches!(self, Value::Thing(_))
 	}
 
+	pub fn is_model(&self) -> bool {
+		matches!(self, Value::Model(_))
+	}
+
+	pub fn is_range(&self) -> bool {
+		matches!(self, Value::Range(_))
+	}
+
 	pub fn is_strand(&self) -> bool {
 		matches!(self, Value::Strand(_))
 	}
@@ -545,6 +569,26 @@ impl Value {
 
 	pub fn is_object(&self) -> bool {
 		matches!(self, Value::Object(_))
+	}
+
+	pub fn is_int(&self) -> bool {
+		matches!(self, Value::Number(Number::Int(_)))
+	}
+
+	pub fn is_float(&self) -> bool {
+		matches!(self, Value::Number(Number::Float(_)))
+	}
+
+	pub fn is_decimal(&self) -> bool {
+		matches!(self, Value::Number(Number::Decimal(_)))
+	}
+
+	pub fn is_integer(&self) -> bool {
+		matches!(self, Value::Number(v) if v.is_integer())
+	}
+
+	pub fn is_positive(&self) -> bool {
+		matches!(self, Value::Number(v) if v.is_positive())
 	}
 
 	pub fn is_type_record(&self, types: &[Table]) -> bool {
@@ -632,7 +676,9 @@ impl Value {
 	pub fn as_strand(self) -> Strand {
 		match self {
 			Value::Strand(v) => v,
-			_ => Strand::from(self.to_string()),
+			Value::Uuid(v) => v.to_raw().into(),
+			Value::Datetime(v) => v.to_raw().into(),
+			_ => self.to_string().into(),
 		}
 	}
 
@@ -659,6 +705,13 @@ impl Value {
 		}
 	}
 
+	pub fn as_usize(self) -> usize {
+		match self {
+			Value::Number(v) => v.as_usize(),
+			_ => 0,
+		}
+	}
+
 	// -----------------------------------
 	// Expensive conversion of value
 	// -----------------------------------
@@ -677,7 +730,9 @@ impl Value {
 	pub fn to_strand(&self) -> Strand {
 		match self {
 			Value::Strand(v) => v.clone(),
-			_ => Strand::from(self.to_string()),
+			Value::Uuid(v) => v.to_raw().into(),
+			Value::Datetime(v) => v.to_raw().into(),
+			_ => self.to_string().into(),
 		}
 	}
 
@@ -842,14 +897,14 @@ impl Value {
 	// -----------------------------------
 
 	/// Fetch the record id if there is one
-	pub fn rid(self) -> Option<Thing> {
+	pub fn record(self) -> Option<Thing> {
 		match self {
 			Value::Object(mut v) => match v.remove("id") {
 				Some(Value::Thing(v)) => Some(v),
 				_ => None,
 			},
 			Value::Array(mut v) => match v.len() {
-				1 => v.remove(0).rid(),
+				1 => v.remove(0).record(),
 				_ => None,
 			},
 			Value::Thing(v) => Some(v),
@@ -1082,6 +1137,7 @@ impl fmt::Display for Value {
 			Value::Regex(v) => write!(f, "{}", v),
 			Value::Range(v) => write!(f, "{}", v),
 			Value::Edges(v) => write!(f, "{}", v),
+			Value::Constant(v) => write!(f, "{}", v),
 			Value::Function(v) => write!(f, "{}", v),
 			Value::Subquery(v) => write!(f, "{}", v),
 			Value::Expression(v) => write!(f, "{}", v),
@@ -1120,6 +1176,7 @@ impl Value {
 			Value::Idiom(v) => v.compute(ctx, opt, txn, doc).await,
 			Value::Array(v) => v.compute(ctx, opt, txn, doc).await,
 			Value::Object(v) => v.compute(ctx, opt, txn, doc).await,
+			Value::Constant(v) => v.compute(ctx, opt, txn, doc).await,
 			Value::Function(v) => v.compute(ctx, opt, txn, doc).await,
 			Value::Subquery(v) => v.compute(ctx, opt, txn, doc).await,
 			Value::Expression(v) => v.compute(ctx, opt, txn, doc).await,
@@ -1155,9 +1212,10 @@ impl Serialize for Value {
 				Value::Regex(v) => s.serialize_newtype_variant("Value", 17, "Regex", v),
 				Value::Range(v) => s.serialize_newtype_variant("Value", 18, "Range", v),
 				Value::Edges(v) => s.serialize_newtype_variant("Value", 19, "Edges", v),
-				Value::Function(v) => s.serialize_newtype_variant("Value", 20, "Function", v),
-				Value::Subquery(v) => s.serialize_newtype_variant("Value", 21, "Subquery", v),
-				Value::Expression(v) => s.serialize_newtype_variant("Value", 22, "Expression", v),
+				Value::Constant(v) => s.serialize_newtype_variant("Value", 20, "Constant", v),
+				Value::Function(v) => s.serialize_newtype_variant("Value", 21, "Function", v),
+				Value::Subquery(v) => s.serialize_newtype_variant("Value", 22, "Subquery", v),
+				Value::Expression(v) => s.serialize_newtype_variant("Value", 23, "Expression", v),
 			}
 		} else {
 			match self {
@@ -1174,6 +1232,7 @@ impl Serialize for Value {
 				Value::Geometry(v) => s.serialize_some(v),
 				Value::Duration(v) => s.serialize_some(v),
 				Value::Datetime(v) => s.serialize_some(v),
+				Value::Constant(v) => s.serialize_some(v),
 				_ => s.serialize_none(),
 			}
 		}
@@ -1199,6 +1258,7 @@ impl ops::Sub for Value {
 	fn sub(self, other: Self) -> Self {
 		match (self, other) {
 			(Value::Number(v), Value::Number(w)) => Value::Number(v - w),
+			(Value::Datetime(v), Value::Datetime(w)) => Value::Duration(v - w),
 			(Value::Datetime(v), Value::Duration(w)) => Value::Datetime(w - v),
 			(Value::Duration(v), Value::Datetime(w)) => Value::Datetime(v - w),
 			(Value::Duration(v), Value::Duration(w)) => Value::Duration(v - w),
@@ -1220,10 +1280,9 @@ impl ops::Mul for Value {
 impl ops::Div for Value {
 	type Output = Self;
 	fn div(self, other: Self) -> Self {
-		match (self, other) {
-			(Value::Number(v), Value::Number(w)) => Value::Number(v / w),
-			(Value::Datetime(v), Value::Duration(w)) => Value::Datetime(w / v),
-			(v, w) => Value::from(v.as_number() / w.as_number()),
+		match (self.as_number(), other.as_number()) {
+			(_, w) if w == Number::Int(0) => Value::None,
+			(v, w) => Value::Number(v / w),
 		}
 	}
 }
@@ -1247,6 +1306,7 @@ pub fn single(i: &str) -> IResult<&str, Value> {
 		alt((
 			map(subquery, Value::from),
 			map(function, Value::from),
+			map(constant, Value::from),
 			map(datetime, Value::from),
 			map(duration, Value::from),
 			map(geometry, Value::from),
@@ -1276,6 +1336,7 @@ pub fn select(i: &str) -> IResult<&str, Value> {
 			map(expression, Value::from),
 			map(subquery, Value::from),
 			map(function, Value::from),
+			map(constant, Value::from),
 			map(datetime, Value::from),
 			map(duration, Value::from),
 			map(geometry, Value::from),
@@ -1299,6 +1360,7 @@ pub fn what(i: &str) -> IResult<&str, Value> {
 	alt((
 		map(subquery, Value::from),
 		map(function, Value::from),
+		map(constant, Value::from),
 		map(param, Value::from),
 		map(model, Value::from),
 		map(edges, Value::from),
@@ -1330,6 +1392,7 @@ mod tests {
 
 	use super::*;
 	use crate::sql::test::Parse;
+	use crate::sql::uuid::Uuid;
 
 	#[test]
 	fn check_none() {
@@ -1382,6 +1445,7 @@ mod tests {
 		assert_eq!(false, Value::from("false").is_truthy());
 		assert_eq!(true, Value::from("falsey").is_truthy());
 		assert_eq!(true, Value::from("something").is_truthy());
+		assert_eq!(true, Value::from(Uuid::new()).is_truthy());
 	}
 
 	#[test]
@@ -1472,7 +1536,7 @@ mod tests {
 	#[test]
 	fn check_size() {
 		assert_eq!(64, std::mem::size_of::<Value>());
-		assert_eq!(88, std::mem::size_of::<Result<Value, Error>>());
+		assert_eq!(112, std::mem::size_of::<Result<Value, Error>>());
 		assert_eq!(48, std::mem::size_of::<crate::sql::number::Number>());
 		assert_eq!(24, std::mem::size_of::<crate::sql::strand::Strand>());
 		assert_eq!(16, std::mem::size_of::<crate::sql::duration::Duration>());

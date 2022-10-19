@@ -1,21 +1,24 @@
+use crate::sql::error::Error::ParserError;
 use crate::sql::error::IResult;
-use crate::sql::escape::escape_strand;
+use crate::sql::escape::escape_str;
 use crate::sql::serde::is_internal_serialization;
 use nom::branch::alt;
-use nom::bytes::complete::escaped;
+use nom::bytes::complete::escaped_transform;
 use nom::bytes::complete::is_not;
-use nom::bytes::complete::tag;
-use nom::character::complete::one_of;
+use nom::bytes::complete::take_while_m_n;
+use nom::character::complete::char;
+use nom::combinator::value;
+use nom::Err::Error;
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::fmt::{self, Display, Formatter};
 use std::ops;
 use std::ops::Deref;
 use std::str;
 
-const SINGLE: &str = r#"'"#;
+const SINGLE: char = '\'';
 const SINGLE_ESC: &str = r#"\'"#;
 
-const DOUBLE: &str = r#"""#;
+const DOUBLE: char = '"';
 const DOUBLE_ESC: &str = r#"\""#;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Deserialize)]
@@ -29,7 +32,7 @@ impl From<String> for Strand {
 
 impl From<&str> for Strand {
 	fn from(s: &str) -> Self {
-		Strand(String::from(s))
+		Self::from(String::from(s))
 	}
 }
 
@@ -52,9 +55,9 @@ impl Strand {
 	}
 }
 
-impl fmt::Display for Strand {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		write!(f, "{}", escape_strand(&self.0))
+impl Display for Strand {
+	fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+		Display::fmt(&escape_str(&self.0), f)
 	}
 }
 
@@ -84,21 +87,87 @@ pub fn strand(i: &str) -> IResult<&str, Strand> {
 }
 
 pub fn strand_raw(i: &str) -> IResult<&str, String> {
-	alt((strand_single, strand_double))(i)
+	alt((strand_blank, strand_single, strand_double))(i)
+}
+
+fn strand_blank(i: &str) -> IResult<&str, String> {
+	alt((
+		|i| {
+			let (i, _) = char(SINGLE)(i)?;
+			let (i, _) = char(SINGLE)(i)?;
+			Ok((i, String::new()))
+		},
+		|i| {
+			let (i, _) = char(DOUBLE)(i)?;
+			let (i, _) = char(DOUBLE)(i)?;
+			Ok((i, String::new()))
+		},
+	))(i)
 }
 
 fn strand_single(i: &str) -> IResult<&str, String> {
-	let (i, _) = tag(SINGLE)(i)?;
-	let (i, v) = alt((escaped(is_not(SINGLE_ESC), '\\', one_of(SINGLE)), tag("")))(i)?;
-	let (i, _) = tag(SINGLE)(i)?;
-	Ok((i, String::from(v).replace(SINGLE_ESC, SINGLE)))
+	let (i, _) = char(SINGLE)(i)?;
+	let (i, v) = escaped_transform(
+		is_not(SINGLE_ESC),
+		'\\',
+		alt((
+			strand_unicode,
+			value('\u{5c}', char('\\')),
+			value('\u{27}', char('\'')),
+			value('\u{2f}', char('/')),
+			value('\u{08}', char('b')),
+			value('\u{0c}', char('f')),
+			value('\u{0a}', char('n')),
+			value('\u{0d}', char('r')),
+			value('\u{09}', char('t')),
+		)),
+	)(i)?;
+	let (i, _) = char(SINGLE)(i)?;
+	Ok((i, v))
 }
 
 fn strand_double(i: &str) -> IResult<&str, String> {
-	let (i, _) = tag(DOUBLE)(i)?;
-	let (i, v) = alt((escaped(is_not(DOUBLE_ESC), '\\', one_of(DOUBLE)), tag("")))(i)?;
-	let (i, _) = tag(DOUBLE)(i)?;
-	Ok((i, String::from(v).replace(DOUBLE_ESC, DOUBLE)))
+	let (i, _) = char(DOUBLE)(i)?;
+	let (i, v) = escaped_transform(
+		is_not(DOUBLE_ESC),
+		'\\',
+		alt((
+			strand_unicode,
+			value('\u{5c}', char('\\')),
+			value('\u{22}', char('\"')),
+			value('\u{2f}', char('/')),
+			value('\u{08}', char('b')),
+			value('\u{0c}', char('f')),
+			value('\u{0a}', char('n')),
+			value('\u{0d}', char('r')),
+			value('\u{09}', char('t')),
+		)),
+	)(i)?;
+	let (i, _) = char(DOUBLE)(i)?;
+	Ok((i, v))
+}
+
+fn strand_unicode(i: &str) -> IResult<&str, char> {
+	// Read the \u character
+	let (i, _) = char('u')(i)?;
+	// Let's read the next 6 ascii hexadecimal characters
+	let (i, v) = take_while_m_n(1, 6, |c: char| c.is_ascii_hexdigit())(i)?;
+	// We can convert this to u32 as we only have 6 chars
+	let v = match u32::from_str_radix(v, 16) {
+		// We found an invalid unicode sequence
+		Err(_) => return Err(Error(ParserError(i))),
+		// The unicode sequence was valid
+		Ok(v) => v,
+	};
+	// We can convert this to char as we know it is valid
+	let v = match std::char::from_u32(v) {
+		// We found an invalid unicode sequence
+		None => return Err(Error(ParserError(i))),
+		// The unicode sequence was valid
+		Some(v) => v,
+	};
+	// Return the char
+	Ok((i, v))
 }
 
 #[cfg(test)]
@@ -154,5 +223,15 @@ mod tests {
 		let out = res.unwrap().1;
 		assert_eq!(r#""te"st""#, format!("{}", out));
 		assert_eq!(out, Strand::from(r#"te"st"#));
+	}
+
+	#[test]
+	fn strand_quoted_escaped() {
+		let sql = r#""te\"st\n\tand\bsome\u05d9""#;
+		let res = strand(sql);
+		assert!(res.is_ok());
+		let out = res.unwrap().1;
+		assert_eq!("\"te\"st\n\tand\u{08}some\u{05d9}\"", format!("{}", out));
+		assert_eq!(out, Strand::from("te\"st\n\tand\u{08}some\u{05d9}"));
 	}
 }

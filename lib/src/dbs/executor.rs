@@ -94,7 +94,6 @@ impl<'a> Executor<'a> {
 
 	fn buf_cancel(&self, v: Response) -> Response {
 		Response {
-			sql: v.sql,
 			time: v.time,
 			result: Err(Error::QueryCancelled),
 		}
@@ -103,7 +102,6 @@ impl<'a> Executor<'a> {
 	fn buf_commit(&self, v: Response) -> Response {
 		match &self.err {
 			true => Response {
-				sql: v.sql,
 				time: v.time,
 				result: match v.result {
 					Ok(_) => Err(Error::QueryNotExecuted),
@@ -118,14 +116,14 @@ impl<'a> Executor<'a> {
 		let mut session = ctx.value("session").unwrap_or(&Value::None).clone();
 		session.put(NS.as_ref(), ns.to_owned().into());
 		ctx.add_value(String::from("session"), session);
-		opt.ns = Some(Arc::new(ns.to_owned()));
+		opt.ns = Some(ns.into());
 	}
 
 	async fn set_db(&self, ctx: &mut Context<'_>, opt: &mut Options, db: &str) {
 		let mut session = ctx.value("session").unwrap_or(&Value::None).clone();
 		session.put(DB.as_ref(), db.to_owned().into());
 		ctx.add_value(String::from("session"), session);
-		opt.db = Some(Arc::new(db.to_owned()));
+		opt.db = Some(db.into());
 	}
 
 	pub async fn execute(
@@ -163,7 +161,6 @@ impl<'a> Executor<'a> {
 						"TABLES" => opt = opt.tables(stm.what),
 						"IMPORT" => opt = opt.import(stm.what),
 						"FORCE" => opt = opt.force(stm.what),
-						"DEBUG" => opt = opt.debug(stm.what),
 						_ => break,
 					}
 					// Continue
@@ -197,6 +194,7 @@ impl<'a> Executor<'a> {
 							Auth::No => self.set_ns(&mut ctx, &mut opt, ns).await,
 							Auth::Kv => self.set_ns(&mut ctx, &mut opt, ns).await,
 							Auth::Ns(v) if v == ns => self.set_ns(&mut ctx, &mut opt, ns).await,
+							Auth::Db(v, _) if v == ns => self.set_ns(&mut ctx, &mut opt, ns).await,
 							_ => {
 								opt.ns = None;
 								return Err(Error::NsNotAllowed {
@@ -232,19 +230,27 @@ impl<'a> Executor<'a> {
 						// The transaction began successfully
 						false => {
 							// Process the statement
-							match stm.compute(&ctx, &opt, &self.txn(), None).await {
+							let res = stm.compute(&ctx, &opt, &self.txn(), None).await;
+							//
+							match res {
 								Ok(val) => {
+									// Set the parameter
 									ctx.add_value(stm.name.to_owned(), val);
+									// Finalise transaction
+									match stm.writeable() {
+										true => self.commit(loc).await,
+										false => self.cancel(loc).await,
+									}
+									// Return nothing
+									Ok(Value::None)
 								}
-								_ => break,
+								Err(err) => {
+									// Cancel transaction
+									self.cancel(loc).await;
+									// Return error
+									Err(err)
+								}
 							}
-							// Cancel transaction
-							match stm.writeable() {
-								true => self.commit(loc).await,
-								false => self.cancel(loc).await,
-							};
-							// Return nothing
-							Ok(Value::None)
 						}
 					}
 				}
@@ -300,20 +306,12 @@ impl<'a> Executor<'a> {
 			// Produce the response
 			let res = match res {
 				Ok(v) => Response {
-					sql: match opt.debug {
-						true => Some(format!("{}", stm)),
-						false => None,
-					},
 					time: dur,
 					result: Ok(v),
 				},
 				Err(e) => {
 					// Produce the response
 					let res = Response {
-						sql: match opt.debug {
-							true => Some(format!("{}", stm)),
-							false => None,
-						},
 						time: dur,
 						result: Err(e),
 					};

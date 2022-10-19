@@ -9,7 +9,6 @@ use crate::err::Error;
 use crate::sql::array::Array;
 use crate::sql::edges::Edges;
 use crate::sql::field::Field;
-use crate::sql::part::Part;
 use crate::sql::range::Range;
 use crate::sql::table::Table;
 use crate::sql::thing::Thing;
@@ -45,6 +44,10 @@ pub enum Workable {
 pub struct Iterator {
 	// Iterator status
 	run: Canceller,
+	// Iterator limit value
+	limit: Option<usize>,
+	// Iterator start value
+	start: Option<usize>,
 	// Iterator runtime error
 	error: Option<Error>,
 	// Iterator output results
@@ -77,6 +80,10 @@ impl Iterator {
 		// Enable context override
 		let mut ctx = Context::new(ctx);
 		self.run = ctx.add_cancel();
+		// Process the query LIMIT clause
+		self.setup_limit(&ctx, opt, txn, stm).await?;
+		// Process the query START clause
+		self.setup_start(&ctx, opt, txn, stm).await?;
 		// Process prepared values
 		self.iterate(&ctx, opt, txn, stm).await?;
 		// Return any document errors
@@ -97,6 +104,34 @@ impl Iterator {
 		self.output_fetch(&ctx, opt, txn, stm).await?;
 		// Output the results
 		Ok(mem::take(&mut self.results).into())
+	}
+
+	#[inline]
+	async fn setup_limit(
+		&mut self,
+		ctx: &Context<'_>,
+		opt: &Options,
+		txn: &Transaction,
+		stm: &Statement<'_>,
+	) -> Result<(), Error> {
+		if let Some(v) = stm.limit() {
+			self.limit = Some(v.process(ctx, opt, txn, None).await?);
+		}
+		Ok(())
+	}
+
+	#[inline]
+	async fn setup_start(
+		&mut self,
+		ctx: &Context<'_>,
+		opt: &Options,
+		txn: &Transaction,
+		stm: &Statement<'_>,
+	) -> Result<(), Error> {
+		if let Some(v) = stm.start() {
+			self.start = Some(v.process(ctx, opt, txn, None).await?);
+		}
+		Ok(())
 	}
 
 	#[inline]
@@ -274,10 +309,10 @@ impl Iterator {
 		_ctx: &Context<'_>,
 		_opt: &Options,
 		_txn: &Transaction,
-		stm: &Statement<'_>,
+		_stm: &Statement<'_>,
 	) -> Result<(), Error> {
-		if let Some(v) = stm.start() {
-			self.results = mem::take(&mut self.results).into_iter().skip(v.0).collect();
+		if let Some(v) = self.start {
+			self.results = mem::take(&mut self.results).into_iter().skip(v).collect();
 		}
 		Ok(())
 	}
@@ -288,10 +323,10 @@ impl Iterator {
 		_ctx: &Context<'_>,
 		_opt: &Options,
 		_txn: &Transaction,
-		stm: &Statement<'_>,
+		_stm: &Statement<'_>,
 	) -> Result<(), Error> {
-		if let Some(v) = stm.limit() {
-			self.results = mem::take(&mut self.results).into_iter().take(v.0).collect();
+		if let Some(v) = self.limit {
+			self.results = mem::take(&mut self.results).into_iter().take(v).collect();
 		}
 		Ok(())
 	}
@@ -305,30 +340,11 @@ impl Iterator {
 		stm: &Statement<'_>,
 	) -> Result<(), Error> {
 		if let Some(fetchs) = stm.fetch() {
-			for fetch in &fetchs.0 {
-				// Loop over each value
+			for fetch in fetchs.iter() {
+				// Loop over each result value
 				for obj in &mut self.results {
-					// Get the value at the path
-					let val = obj.get(ctx, opt, txn, fetch).await?;
-					// Set the value at the path
-					match val {
-						Value::Array(v) => {
-							// Fetch all remote records
-							let val = Value::Array(v).get(ctx, opt, txn, &[Part::Any]).await?;
-							// Set the value at the path
-							obj.set(ctx, opt, txn, fetch, val).await?;
-						}
-						Value::Thing(v) => {
-							// Fetch all remote records
-							let val = Value::Thing(v).get(ctx, opt, txn, &[Part::All]).await?;
-							// Set the value at the path
-							obj.set(ctx, opt, txn, fetch, val).await?;
-						}
-						_ => {
-							// Set the value at the path
-							obj.set(ctx, opt, txn, fetch, val).await?;
-						}
-					}
+					// Fetch the value at the path
+					obj.fetch(ctx, opt, txn, fetch).await?;
 				}
 			}
 		}
@@ -345,6 +361,8 @@ impl Iterator {
 		txn: &Transaction,
 		stm: &Statement<'_>,
 	) -> Result<(), Error> {
+		// Prevent deep recursion
+		let opt = &opt.dive(4)?;
 		// Process all prepared values
 		for v in mem::take(&mut self.entries) {
 			v.iterate(ctx, opt, txn, stm, self).await?;
@@ -363,6 +381,9 @@ impl Iterator {
 		txn: &Transaction,
 		stm: &Statement<'_>,
 	) -> Result<(), Error> {
+		// Prevent deep recursion
+		let opt = &opt.dive(4)?;
+		// Check if iterating in parallel
 		match stm.parallel() {
 			// Run statements sequentially
 			false => {
@@ -479,12 +500,12 @@ impl Iterator {
 		}
 		// Check if we can exit
 		if stm.group().is_none() && stm.order().is_none() {
-			if let Some(l) = stm.limit() {
-				if let Some(s) = stm.start() {
-					if self.results.len() == l.0 + s.0 {
+			if let Some(l) = self.limit {
+				if let Some(s) = self.start {
+					if self.results.len() == l + s {
 						self.run.cancel()
 					}
-				} else if self.results.len() == l.0 {
+				} else if self.results.len() == l {
 					self.run.cancel()
 				}
 			}

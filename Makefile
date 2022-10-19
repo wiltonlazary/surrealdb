@@ -5,7 +5,7 @@ default:
 
 .PHONY: setup
 setup:
-	cargo upgrade --workspace --pinned --to-lockfile
+	cargo upgrade --pinned
 	cargo update
 
 .PHONY: docs
@@ -29,6 +29,10 @@ clean:
 .PHONY: serve
 serve:
 	cargo run -- start --log trace --user root --pass root memory
+
+.PHONY: sql
+sql:
+	cargo run -- sql --conn http://0.0.0.0:8000 --user root --pass root --ns test --db test
 
 .PHONY: quick
 quick:

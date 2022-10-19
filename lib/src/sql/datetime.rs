@@ -1,45 +1,45 @@
-use crate::sql::common::{take_digits, take_digits_range, take_u32};
+use crate::sql::common::{take_digits, take_digits_range, take_u32_len};
+use crate::sql::duration::Duration;
 use crate::sql::error::IResult;
+use crate::sql::escape::escape_str;
 use crate::sql::serde::is_internal_serialization;
-use chrono::{DateTime, FixedOffset, TimeZone, Utc};
+use chrono::{DateTime, FixedOffset, SecondsFormat, TimeZone, Utc};
 use nom::branch::alt;
 use nom::character::complete::char;
 use nom::combinator::map;
 use nom::sequence::delimited;
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::fmt::{self, Display, Formatter};
+use std::ops;
 use std::ops::Deref;
 use std::str;
-
-const SINGLE: char = '\'';
-const DOUBLE: char = '"';
 
 #[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Deserialize)]
 pub struct Datetime(pub DateTime<Utc>);
 
 impl Default for Datetime {
 	fn default() -> Self {
-		Datetime(Utc::now())
+		Self(Utc::now())
 	}
 }
 
 impl From<i64> for Datetime {
 	fn from(v: i64) -> Self {
-		Datetime(Utc.timestamp(v, 0))
+		Self(Utc.timestamp(v, 0))
 	}
 }
 
 impl From<DateTime<Utc>> for Datetime {
 	fn from(v: DateTime<Utc>) -> Self {
-		Datetime(v)
+		Self(v)
 	}
 }
 
 impl From<&str> for Datetime {
 	fn from(s: &str) -> Self {
-		match datetime_raw(s) {
+		match datetime_all_raw(s) {
 			Ok((_, v)) => v,
-			Err(_) => Datetime::default(),
+			Err(_) => Self::default(),
 		}
 	}
 }
@@ -51,9 +51,15 @@ impl Deref for Datetime {
 	}
 }
 
-impl fmt::Display for Datetime {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		write!(f, "\"{:?}\"", self.0)
+impl Datetime {
+	pub fn to_raw(&self) -> String {
+		self.0.to_rfc3339_opts(SecondsFormat::AutoSi, true)
+	}
+}
+
+impl Display for Datetime {
+	fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+		Display::fmt(&escape_str(&self.0.to_rfc3339_opts(SecondsFormat::AutoSi, true)), f)
 	}
 }
 
@@ -70,15 +76,34 @@ impl Serialize for Datetime {
 	}
 }
 
+impl ops::Sub<Self> for Datetime {
+	type Output = Duration;
+	fn sub(self, other: Self) -> Duration {
+		match (self.0 - other.0).to_std() {
+			Ok(d) => Duration::from(d),
+			Err(_) => Duration::default(),
+		}
+	}
+}
+
 pub fn datetime(i: &str) -> IResult<&str, Datetime> {
-	alt((
-		delimited(char(DOUBLE), datetime_raw, char(DOUBLE)),
-		delimited(char(SINGLE), datetime_raw, char(SINGLE)),
-	))(i)
+	alt((datetime_single, datetime_double))(i)
+}
+
+fn datetime_single(i: &str) -> IResult<&str, Datetime> {
+	delimited(char('\''), datetime_raw, char('\''))(i)
+}
+
+fn datetime_double(i: &str) -> IResult<&str, Datetime> {
+	delimited(char('\"'), datetime_raw, char('\"'))(i)
+}
+
+fn datetime_all_raw(i: &str) -> IResult<&str, Datetime> {
+	alt((nano, time, date))(i)
 }
 
 fn datetime_raw(i: &str) -> IResult<&str, Datetime> {
-	alt((nano, time, date))(i)
+	alt((nano, time))(i)
 }
 
 fn date(i: &str) -> IResult<&str, Datetime> {
@@ -180,7 +205,17 @@ fn second(i: &str) -> IResult<&str, u32> {
 
 fn nanosecond(i: &str) -> IResult<&str, u32> {
 	let (i, _) = char('.')(i)?;
-	let (i, v) = take_u32(i)?;
+	let (i, (v, l)) = take_u32_len(i)?;
+	let v = match l {
+		l if l <= 2 => v * 10000000,
+		l if l <= 3 => v * 1000000,
+		l if l <= 4 => v * 100000,
+		l if l <= 5 => v * 10000,
+		l if l <= 6 => v * 1000,
+		l if l <= 7 => v * 100,
+		l if l <= 8 => v * 10,
+		_ => v,
+	};
 	Ok((i, v))
 }
 
@@ -201,9 +236,9 @@ fn zone_all(i: &str) -> IResult<&str, Option<FixedOffset>> {
 	if h == 0 && m == 0 {
 		Ok((i, None))
 	} else if s < 0 {
-		Ok((i, { Some(FixedOffset::west((h * 3600 + m) as i32)) }))
+		Ok((i, { Some(FixedOffset::west((h * 3600 + m * 60) as i32)) }))
 	} else if s > 0 {
-		Ok((i, { Some(FixedOffset::east((h * 3600 + m) as i32)) }))
+		Ok((i, { Some(FixedOffset::east((h * 3600 + m * 60) as i32)) }))
 	} else {
 		Ok((i, None))
 	}
@@ -222,15 +257,6 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn date() {
-		let sql = "2012-04-23";
-		let res = datetime_raw(sql);
-		assert!(res.is_ok());
-		let out = res.unwrap().1;
-		assert_eq!("\"2012-04-23T00:00:00Z\"", format!("{}", out));
-	}
-
-	#[test]
 	fn date_time() {
 		let sql = "2012-04-23T18:25:43Z";
 		let res = datetime_raw(sql);
@@ -245,16 +271,16 @@ mod tests {
 		let res = datetime_raw(sql);
 		assert!(res.is_ok());
 		let out = res.unwrap().1;
-		assert_eq!("\"2012-04-23T18:25:43.000005631Z\"", format!("{}", out));
+		assert_eq!("\"2012-04-23T18:25:43.563100Z\"", format!("{}", out));
 	}
 
 	#[test]
 	fn date_time_timezone_utc() {
-		let sql = "2012-04-23T18:25:43.511Z";
+		let sql = "2012-04-23T18:25:43.0000511Z";
 		let res = datetime_raw(sql);
 		assert!(res.is_ok());
 		let out = res.unwrap().1;
-		assert_eq!("\"2012-04-23T18:25:43.000000511Z\"", format!("{}", out));
+		assert_eq!("\"2012-04-23T18:25:43.000051100Z\"", format!("{}", out));
 	}
 
 	#[test]
@@ -263,6 +289,15 @@ mod tests {
 		let res = datetime_raw(sql);
 		assert!(res.is_ok());
 		let out = res.unwrap().1;
-		assert_eq!("\"2012-04-24T02:25:43.000000511Z\"", format!("{}", out));
+		assert_eq!("\"2012-04-24T02:25:43.511Z\"", format!("{}", out));
+	}
+
+	#[test]
+	fn date_time_timezone_pacific_partial() {
+		let sql = "2012-04-23T18:25:43.511-08:30";
+		let res = datetime_raw(sql);
+		assert!(res.is_ok());
+		let out = res.unwrap().1;
+		assert_eq!("\"2012-04-24T02:55:43.511Z\"", format!("{}", out));
 	}
 }

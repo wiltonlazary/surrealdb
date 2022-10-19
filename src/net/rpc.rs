@@ -1,8 +1,11 @@
 use crate::cli::CF;
 use crate::cnf::MAX_CONCURRENT_CALLS;
+use crate::cnf::PKG_NAME;
+use crate::cnf::PKG_VERS;
 use crate::dbs::DB;
 use crate::err::Error;
 use crate::net::session;
+use crate::net::LOG;
 use crate::rpc::args::Take;
 use crate::rpc::paths::{ID, METHOD, PARAMS};
 use crate::rpc::res::Failure;
@@ -60,15 +63,34 @@ impl Rpc {
 		let (mut wtx, mut wrx) = ws.split();
 		// Send messages to the client
 		tokio::task::spawn(async move {
+			// Wait for the next message to send
 			while let Some(res) = rcv.next().await {
-				wtx.send(res).await.unwrap();
+				// Send the message to the client
+				if let Err(err) = wtx.send(res).await {
+					// Output the WebSocket error to the logs
+					trace!(target: LOG, "WebSocket error: {:?}", err);
+					// It's already failed, so ignore error
+					let _ = wtx.close().await;
+					// Exit out of the loop
+					break;
+				}
 			}
 		});
 		// Get messages from the client
 		while let Some(msg) = wrx.next().await {
-			if let Ok(msg) = msg {
-				if msg.is_text() {
-					tokio::task::spawn(Rpc::call(rpc.clone(), msg, chn.clone()));
+			match msg {
+				// We've received a message from the client
+				Ok(msg) => {
+					if msg.is_text() {
+						tokio::task::spawn(Rpc::call(rpc.clone(), msg, chn.clone()));
+					}
+				}
+				// There was an error receiving the message
+				Err(err) => {
+					// Output the WebSocket error to the logs
+					trace!(target: LOG, "WebSocket error: {:?}", err);
+					// Exit out of the loop
+					break;
 				}
 			}
 		}
@@ -92,6 +114,7 @@ impl Rpc {
 		let id = match req.pick(&*ID) {
 			Value::Uuid(v) => Some(v.to_raw()),
 			Value::Strand(v) => Some(v.to_raw()),
+			Value::Number(v) => Some(v.to_string()),
 			_ => return Response::failure(None, Failure::INVALID_REQUEST).send(chn).await,
 		};
 		// Fetch the 'method' argument
@@ -187,6 +210,10 @@ impl Rpc {
 			"delete" => match params.take_one() {
 				v if v.is_thing() => rpc.read().await.delete(v).await,
 				v if v.is_strand() => rpc.read().await.delete(v).await,
+				_ => return Response::failure(id, Failure::INVALID_PARAMS).send(chn).await,
+			},
+			"version" => match params.len() {
+				0 => Ok(format!("{}-{}", PKG_NAME, *PKG_VERS).into()),
 				_ => return Response::failure(id, Failure::INVALID_PARAMS).send(chn).await,
 			},
 			_ => return Response::failure(id, Failure::METHOD_NOT_FOUND).send(chn).await,

@@ -18,8 +18,8 @@ use std::str;
 pub struct Param(pub Idiom);
 
 impl From<Idiom> for Param {
-	fn from(p: Idiom) -> Param {
-		Param(p)
+	fn from(p: Idiom) -> Self {
+		Self(p)
 	}
 }
 
@@ -83,6 +83,12 @@ impl fmt::Display for Param {
 pub fn param(i: &str) -> IResult<&str, Param> {
 	let (i, _) = char('$')(i)?;
 	let (i, v) = idiom::param(i)?;
+	Ok((i, Param::from(v)))
+}
+
+pub fn basic(i: &str) -> IResult<&str, Param> {
+	let (i, _) = char('$')(i)?;
+	let (i, v) = idiom::basic(i)?;
 	Ok((i, Param::from(v)))
 }
 

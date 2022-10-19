@@ -1,5 +1,6 @@
 use crate::sql::common::is_hex;
 use crate::sql::error::IResult;
+use crate::sql::escape::escape_str;
 use crate::sql::serde::is_internal_serialization;
 use nom::branch::alt;
 use nom::bytes::complete::take_while_m_n;
@@ -8,31 +9,22 @@ use nom::combinator::recognize;
 use nom::sequence::delimited;
 use nom::sequence::tuple;
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::fmt::{self, Display, Formatter};
 use std::ops::Deref;
 use std::str;
-
-const SINGLE: char = '\'';
-const DOUBLE: char = '"';
 
 #[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Deserialize)]
 pub struct Uuid(pub uuid::Uuid);
 
 impl From<&str> for Uuid {
 	fn from(s: &str) -> Self {
-		match uuid::Uuid::try_parse(s) {
-			Ok(v) => Uuid(v),
-			_ => Uuid::default(),
-		}
+		uuid::Uuid::try_parse(s).map(Self).unwrap_or_default()
 	}
 }
 
 impl From<String> for Uuid {
 	fn from(s: String) -> Self {
-		match uuid::Uuid::try_parse(&s) {
-			Ok(v) => Uuid(v),
-			_ => Uuid::default(),
-		}
+		Self::from(s.as_str())
 	}
 }
 
@@ -45,16 +37,22 @@ impl Deref for Uuid {
 
 impl Uuid {
 	pub fn new() -> Self {
-		Uuid(uuid::Uuid::new_v4())
+		Self(uuid::Uuid::new_v4())
+	}
+	pub fn new_v4() -> Self {
+		Self(uuid::Uuid::new_v4())
+	}
+	pub fn new_v7() -> Self {
+		Self(uuid::Uuid::now_v7())
 	}
 	pub fn to_raw(&self) -> String {
 		self.0.to_string()
 	}
 }
 
-impl fmt::Display for Uuid {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		write!(f, "\"{}\"", self.0)
+impl Display for Uuid {
+	fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+		Display::fmt(&escape_str(&self.0.to_string()), f)
 	}
 }
 
@@ -72,10 +70,15 @@ impl Serialize for Uuid {
 }
 
 pub fn uuid(i: &str) -> IResult<&str, Uuid> {
-	alt((
-		delimited(char(DOUBLE), uuid_raw, char(DOUBLE)),
-		delimited(char(SINGLE), uuid_raw, char(SINGLE)),
-	))(i)
+	alt((uuid_single, uuid_double))(i)
+}
+
+fn uuid_single(i: &str) -> IResult<&str, Uuid> {
+	delimited(char('\''), uuid_raw, char('\''))(i)
+}
+
+fn uuid_double(i: &str) -> IResult<&str, Uuid> {
+	delimited(char('\"'), uuid_raw, char('\"'))(i)
 }
 
 fn uuid_raw(i: &str) -> IResult<&str, Uuid> {
@@ -84,7 +87,16 @@ fn uuid_raw(i: &str) -> IResult<&str, Uuid> {
 		char('-'),
 		take_while_m_n(4, 4, is_hex),
 		char('-'),
-		alt((char('1'), char('2'), char('3'), char('4'))),
+		alt((
+			char('1'),
+			char('2'),
+			char('3'),
+			char('4'),
+			char('5'),
+			char('6'),
+			char('7'),
+			char('8'),
+		)),
 		take_while_m_n(3, 3, is_hex),
 		char('-'),
 		take_while_m_n(4, 4, is_hex),

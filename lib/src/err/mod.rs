@@ -54,6 +54,10 @@ pub enum Error {
 	QueryEmpty,
 
 	/// There was an error with the SQL query
+	#[error("The SQL query was not parsed fully")]
+	QueryRemaining,
+
+	/// There was an error with the SQL query
 	#[error("Parse error on line {line} at character {char} when parsing '{sql}'")]
 	InvalidQuery {
 		line: usize,
@@ -70,6 +74,18 @@ pub enum Error {
 	/// Remote HTTP request functions are not enabled
 	#[error("Remote HTTP request functions are not enabled")]
 	HttpDisabled,
+
+	/// The LIMIT clause must evaluate to a positive integer
+	#[error("Found {value} but the LIMIT clause must evaluate to a positive integer")]
+	InvalidLimit {
+		value: String,
+	},
+
+	/// The START clause must evaluate to a positive integer
+	#[error("Found {value} but the START clause must evaluate to a positive integer")]
+	InvalidStart {
+		value: String,
+	},
 
 	/// There was an error with the provided JavaScript code
 	#[error("Problem with embedded script function. {message}")]
@@ -152,9 +168,9 @@ pub enum Error {
 	#[error("Unable to perform the realtime query")]
 	RealtimeDisabled,
 
-	/// Too many recursive subqueries have been processed
-	#[error("Too many recursive subqueries have been processed")]
-	TooManySubqueries,
+	/// Reached excessive computation depth due to functions, subqueries, or futures
+	#[error("Reached excessive computation depth due to functions, subqueries, or futures")]
+	ComputationDepthExceeded,
 
 	/// Can not execute CREATE query using the specified value
 	#[error("Can not execute CREATE query using value '{value}'")]
@@ -217,15 +233,17 @@ pub enum Error {
 	},
 
 	/// A database index entry for the specified record already exists
-	#[error("Database index `{index}` already contains {value}")]
+	#[error("Database index `{index}` already contains {value}, with record `{thing}`")]
 	IndexExists {
+		thing: String,
 		index: String,
 		value: String,
 	},
 
 	/// The specified field did not conform to the field ASSERT clause
-	#[error("Found {value} for field `{field}` but field must conform to: {check}")]
+	#[error("Found {value} for field `{field}`, with record `{thing}`, but field must conform to: {check}")]
 	FieldValue {
+		thing: String,
 		value: String,
 		field: Idiom,
 		check: String,

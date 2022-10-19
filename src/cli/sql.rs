@@ -1,7 +1,7 @@
 use crate::err::Error;
 use reqwest::blocking::Client;
 use reqwest::blocking::Response;
-use reqwest::header::CONTENT_TYPE;
+use reqwest::header::ACCEPT;
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
 use serde_json::Value;
@@ -32,12 +32,16 @@ pub fn init(matches: &clap::ArgMatches) -> Result<(), Error> {
 		match readline {
 			// The user typed a query
 			Ok(line) => {
+				// Ignore all empty lines
+				if line.is_empty() {
+					continue;
+				}
 				// Add the entry to the history
 				rl.add_history_entry(line.as_str());
 				// Make a new remote request
 				let res = Client::new()
 					.post(&conn)
-					.header(CONTENT_TYPE, "application/json")
+					.header(ACCEPT, "application/json")
 					.basic_auth(user, Some(pass));
 				// Add NS header if specified
 				let res = match ns {
@@ -88,13 +92,18 @@ fn process(pretty: bool, res: reqwest::Result<Response>) -> Result<String, Error
 		// Don't prettify the response
 		false => Ok(res),
 		// Yes prettify the response
-		true => {
-			// Parse the JSON response
-			let res: Value = serde_json::from_str(&res)?;
-			// Pretty the JSON response
-			let res = serde_json::to_string_pretty(&res)?;
-			// Everything processed OK
-			Ok(res)
-		}
+		true => match res.is_empty() {
+			// This was an empty response
+			true => Ok(res),
+			// Let's make this response pretty
+			false => {
+				// Parse the JSON response
+				let res: Value = serde_json::from_str(&res)?;
+				// Pretty the JSON response
+				let res = serde_json::to_string_pretty(&res)?;
+				// Everything processed OK
+				Ok(res)
+			}
+		},
 	}
 }
