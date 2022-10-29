@@ -28,7 +28,7 @@ use nom::sequence::preceded;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, Store)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, Store, Hash)]
 pub struct RelateStatement {
 	pub kind: Table,
 	pub from: Value,
@@ -150,7 +150,7 @@ impl RelateStatement {
 				let w = w.clone();
 				match &self.data {
 					// There is a data clause so check for a record id
-					Some(data) => match data.rid(&self.kind) {
+					Some(data) => match data.rid(ctx, opt, txn, &self.kind).await {
 						// There was a problem creating the record id
 						Err(e) => return Err(e),
 						// There is an id field so use the record id

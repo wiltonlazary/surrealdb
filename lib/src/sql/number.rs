@@ -1,3 +1,4 @@
+use crate::err::Error;
 use crate::sql::ending::number as ending;
 use crate::sql::error::IResult;
 use crate::sql::serde::is_internal_serialization;
@@ -11,6 +12,7 @@ use nom::number::complete::recognize_float;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fmt::{self, Display, Formatter};
+use std::hash;
 use std::iter::Product;
 use std::iter::Sum;
 use std::ops;
@@ -116,6 +118,36 @@ impl From<String> for Number {
 impl From<BigDecimal> for Number {
 	fn from(v: BigDecimal) -> Self {
 		Self::Decimal(v)
+	}
+}
+
+impl TryFrom<Number> for i64 {
+	type Error = Error;
+	fn try_from(value: Number) -> Result<Self, Self::Error> {
+		match value {
+			Number::Int(x) => Ok(x),
+			_ => Err(Error::TryFromError(value.to_string(), "i64")),
+		}
+	}
+}
+
+impl TryFrom<Number> for f64 {
+	type Error = Error;
+	fn try_from(value: Number) -> Result<Self, Self::Error> {
+		match value {
+			Number::Float(x) => Ok(x),
+			_ => Err(Error::TryFromError(value.to_string(), "f64")),
+		}
+	}
+}
+
+impl TryFrom<Number> for BigDecimal {
+	type Error = Error;
+	fn try_from(value: Number) -> Result<Self, Self::Error> {
+		match value {
+			Number::Decimal(x) => Ok(x),
+			_ => Err(Error::TryFromError(value.to_string(), "BigDecimal")),
+		}
 	}
 }
 
@@ -285,7 +317,14 @@ impl Number {
 		match self {
 			Number::Int(v) => v.into(),
 			Number::Float(v) => v.ceil().into(),
-			Number::Decimal(v) => (v + BigDecimal::from_f32(0.5).unwrap()).round(0).into(),
+			Number::Decimal(v) => {
+				if v.digits() > 16 {
+					let v = (v.to_f64().unwrap_or_default() + 0.5).round();
+					BigDecimal::from_f64(v).unwrap_or_default().into()
+				} else {
+					(v + BigDecimal::from_f32(0.5).unwrap()).round(0).into()
+				}
+			}
 		}
 	}
 
@@ -293,7 +332,14 @@ impl Number {
 		match self {
 			Number::Int(v) => v.into(),
 			Number::Float(v) => v.floor().into(),
-			Number::Decimal(v) => (v - BigDecimal::from_f32(0.5).unwrap()).round(0).into(),
+			Number::Decimal(v) => {
+				if v.digits() > 16 {
+					let v = (v.to_f64().unwrap_or_default() - 0.5).round();
+					BigDecimal::from_f64(v).unwrap_or_default().into()
+				} else {
+					(v - BigDecimal::from_f32(0.5).unwrap()).round(0).into()
+				}
+			}
 		}
 	}
 
@@ -301,7 +347,14 @@ impl Number {
 		match self {
 			Number::Int(v) => v.into(),
 			Number::Float(v) => v.round().into(),
-			Number::Decimal(v) => v.round(0).into(),
+			Number::Decimal(v) => {
+				if v.digits() > 16 {
+					let v = v.to_f64().unwrap_or_default().round();
+					BigDecimal::from_f64(v).unwrap_or_default().into()
+				} else {
+					v.round(0).into()
+				}
+			}
 		}
 	}
 
@@ -331,6 +384,16 @@ impl Eq for Number {}
 impl Ord for Number {
 	fn cmp(&self, other: &Self) -> Ordering {
 		self.partial_cmp(other).unwrap_or(Ordering::Equal)
+	}
+}
+
+impl hash::Hash for Number {
+	fn hash<H: hash::Hasher>(&self, state: &mut H) {
+		match self {
+			Number::Int(v) => v.hash(state),
+			Number::Float(v) => v.to_bits().hash(state),
+			Number::Decimal(v) => v.hash(state),
+		}
 	}
 }
 

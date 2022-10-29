@@ -41,6 +41,10 @@ pub enum Error {
 	#[error("The key being inserted already exists")]
 	TxKeyAlreadyExists,
 
+	/// It's is not possible to convert between the two types
+	#[error("Cannot convert from '{0}' to '{1}'")]
+	TryFromError(String, &'static str),
+
 	/// No namespace has been selected
 	#[error("Specify a namespace to use")]
 	NsEmpty,
@@ -90,6 +94,13 @@ pub enum Error {
 	/// There was an error with the provided JavaScript code
 	#[error("Problem with embedded script function. {message}")]
 	InvalidScript {
+		message: String,
+	},
+
+	/// There was a problem running the specified function
+	#[error("There was a problem running the {name}() function. {message}")]
+	InvalidFunction {
+		name: String,
 		message: String,
 	},
 
