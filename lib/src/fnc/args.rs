@@ -45,6 +45,12 @@ impl FromArg for i64 {
 	}
 }
 
+impl FromArg for isize {
+	fn from_arg(arg: Value) -> Result<Self, Error> {
+		Ok(arg.as_int() as isize)
+	}
+}
+
 impl FromArg for usize {
 	fn from_arg(arg: Value) -> Result<Self, Error> {
 		Ok(arg.as_int() as usize)
@@ -65,8 +71,8 @@ impl FromArgs for Vec<Value> {
 	}
 }
 
-// Some functions take a fixed number of arguments.
-// The len must match the number of type idents that follow.
+/// Some functions take a fixed number of arguments.
+/// The len must match the number of type idents that follow.
 macro_rules! impl_tuple {
 	($len:expr, $( $T:ident ),*) => {
 		impl<$($T:FromArg),*> FromArgs for ($($T,)*) {

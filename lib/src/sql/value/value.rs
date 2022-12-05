@@ -465,7 +465,7 @@ impl From<Id> for Value {
 	fn from(v: Id) -> Self {
 		match v {
 			Id::Number(v) => v.into(),
-			Id::String(v) => Strand::from(v).into(),
+			Id::String(v) => v.into(),
 			Id::Object(v) => v.into(),
 			Id::Array(v) => v.into(),
 		}
@@ -610,7 +610,7 @@ impl Value {
 	}
 
 	pub fn is_some(&self) -> bool {
-		!self.is_none()
+		!self.is_none() && !self.is_null()
 	}
 
 	pub fn is_true(&self) -> bool {
@@ -1147,11 +1147,11 @@ impl Value {
 			Value::Array(v) => v.iter().any(|v| v.equal(other)),
 			Value::Thing(v) => match other {
 				Value::Strand(w) => v.to_string().contains(w.as_str()),
-				_ => v.to_string().contains(&other.to_string().as_str()),
+				_ => v.to_string().contains(other.to_string().as_str()),
 			},
 			Value::Strand(v) => match other {
 				Value::Strand(w) => v.contains(w.as_str()),
-				_ => v.contains(&other.to_string().as_str()),
+				_ => v.contains(other.to_string().as_str()),
 			},
 			Value::Geometry(v) => match other {
 				Value::Geometry(w) => v.contains(w),
@@ -1278,6 +1278,7 @@ impl Value {
 			Value::True => Ok(Value::True),
 			Value::False => Ok(Value::False),
 			Value::Thing(v) => v.compute(ctx, opt, txn, doc).await,
+			Value::Range(v) => v.compute(ctx, opt, txn, doc).await,
 			Value::Param(v) => v.compute(ctx, opt, txn, doc).await,
 			Value::Idiom(v) => v.compute(ctx, opt, txn, doc).await,
 			Value::Array(v) => v.compute(ctx, opt, txn, doc).await,
@@ -1648,8 +1649,8 @@ mod tests {
 	#[test]
 	fn check_size() {
 		assert_eq!(64, std::mem::size_of::<Value>());
-		assert_eq!(112, std::mem::size_of::<Result<Value, Error>>());
-		assert_eq!(48, std::mem::size_of::<crate::sql::number::Number>());
+		assert_eq!(104, std::mem::size_of::<Result<Value, Error>>());
+		assert_eq!(40, std::mem::size_of::<crate::sql::number::Number>());
 		assert_eq!(24, std::mem::size_of::<crate::sql::strand::Strand>());
 		assert_eq!(16, std::mem::size_of::<crate::sql::duration::Duration>());
 		assert_eq!(12, std::mem::size_of::<crate::sql::datetime::Datetime>());
@@ -1660,7 +1661,7 @@ mod tests {
 		assert_eq!(24, std::mem::size_of::<crate::sql::idiom::Idiom>());
 		assert_eq!(24, std::mem::size_of::<crate::sql::table::Table>());
 		assert_eq!(56, std::mem::size_of::<crate::sql::thing::Thing>());
-		assert_eq!(48, std::mem::size_of::<crate::sql::model::Model>());
+		assert_eq!(40, std::mem::size_of::<crate::sql::model::Model>());
 		assert_eq!(24, std::mem::size_of::<crate::sql::regex::Regex>());
 		assert_eq!(8, std::mem::size_of::<Box<crate::sql::range::Range>>());
 		assert_eq!(8, std::mem::size_of::<Box<crate::sql::edges::Edges>>());

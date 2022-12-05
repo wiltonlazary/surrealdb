@@ -32,21 +32,21 @@ impl PartialOrd for Function {
 }
 
 impl Function {
-	// Get function name if applicable
+	/// Get function name if applicable
 	pub fn name(&self) -> &str {
 		match self {
 			Self::Normal(n, _) => n.as_str(),
 			_ => unreachable!(),
 		}
 	}
-	// Get function arguments if applicable
+	/// Get function arguments if applicable
 	pub fn args(&self) -> &[Value] {
 		match self {
 			Self::Normal(_, a) => a,
 			_ => &[],
 		}
 	}
-	// Convert this function to an aggregate
+	/// Convert this function to an aggregate
 	pub fn aggregate(&self, val: Value) -> Self {
 		match self {
 			Self::Normal(n, a) => {
@@ -63,7 +63,7 @@ impl Function {
 			_ => unreachable!(),
 		}
 	}
-	// Check if this function is a rolling function
+	/// Check if this function is a rolling function
 	pub fn is_rolling(&self) -> bool {
 		match self {
 			Self::Normal(f, _) if f == "count" => true,
@@ -74,7 +74,7 @@ impl Function {
 			_ => false,
 		}
 	}
-	// Check if this function is a grouping function
+	/// Check if this function is a grouping function
 	pub fn is_aggregate(&self) -> bool {
 		match self {
 			Self::Normal(f, _) if f == "array::concat" => true,
@@ -231,8 +231,10 @@ fn function_names(i: &str) -> IResult<&str, &str> {
 fn function_array(i: &str) -> IResult<&str, &str> {
 	alt((
 		tag("array::combine"),
+		tag("array::complement"),
 		tag("array::concat"),
 		tag("array::difference"),
+		tag("array::flatten"),
 		tag("array::distinct"),
 		tag("array::intersect"),
 		tag("array::len"),
@@ -422,12 +424,12 @@ fn function_time(i: &str) -> IResult<&str, &str> {
 		tag("time::format"),
 		tag("time::group"),
 		tag("time::hour"),
-		tag("time::mins"),
+		tag("time::minute"),
 		tag("time::month"),
 		tag("time::nano"),
 		tag("time::now"),
 		tag("time::round"),
-		tag("time::secs"),
+		tag("time::second"),
 		tag("time::unix"),
 		tag("time::wday"),
 		tag("time::week"),

@@ -1,22 +1,31 @@
 use crate::err::Error;
 use crate::sql::array::Combine;
+use crate::sql::array::Complement;
 use crate::sql::array::Concat;
 use crate::sql::array::Difference;
+use crate::sql::array::Flatten;
 use crate::sql::array::Intersect;
 use crate::sql::array::Union;
 use crate::sql::array::Uniq;
 use crate::sql::value::Value;
 
-pub fn concat(arrays: (Value, Value)) -> Result<Value, Error> {
+pub fn combine(arrays: (Value, Value)) -> Result<Value, Error> {
 	Ok(match arrays {
-		(Value::Array(v), Value::Array(w)) => v.concat(w).into(),
+		(Value::Array(v), Value::Array(w)) => v.combine(w).into(),
 		_ => Value::None,
 	})
 }
 
-pub fn combine(arrays: (Value, Value)) -> Result<Value, Error> {
+pub fn complement(arrays: (Value, Value)) -> Result<Value, Error> {
 	Ok(match arrays {
-		(Value::Array(v), Value::Array(w)) => v.combine(w).into(),
+		(Value::Array(v), Value::Array(w)) => v.complement(w).into(),
+		_ => Value::None,
+	})
+}
+
+pub fn concat(arrays: (Value, Value)) -> Result<Value, Error> {
+	Ok(match arrays {
+		(Value::Array(v), Value::Array(w)) => v.concat(w).into(),
 		_ => Value::None,
 	})
 }
@@ -33,6 +42,13 @@ pub fn distinct((arg,): (Value,)) -> Result<Value, Error> {
 		Value::Array(v) => Ok(v.uniq().into()),
 		_ => Ok(Value::None),
 	}
+}
+
+pub fn flatten((arg,): (Value,)) -> Result<Value, Error> {
+	Ok(match arg {
+		Value::Array(v) => v.flatten().into(),
+		_ => Value::None,
+	})
 }
 
 pub fn intersect(arrays: (Value, Value)) -> Result<Value, Error> {
@@ -54,7 +70,7 @@ pub fn sort((array, order): (Value, Option<Value>)) -> Result<Value, Error> {
 		Value::Array(mut v) => match order {
 			// If "asc", sort ascending
 			Some(Value::Strand(s)) if s.as_str() == "asc" => {
-				v.sort_unstable_by(|a, b| a.cmp(b));
+				v.sort_unstable();
 				Ok(v.into())
 			}
 			// If "desc", sort descending
@@ -64,7 +80,7 @@ pub fn sort((array, order): (Value, Option<Value>)) -> Result<Value, Error> {
 			}
 			// If true, sort ascending
 			Some(Value::True) => {
-				v.sort_unstable_by(|a, b| a.cmp(b));
+				v.sort_unstable();
 				Ok(v.into())
 			}
 			// If false, sort descending
@@ -74,7 +90,7 @@ pub fn sort((array, order): (Value, Option<Value>)) -> Result<Value, Error> {
 			}
 			// Sort ascending by default
 			_ => {
-				v.sort_unstable_by(|a, b| a.cmp(b));
+				v.sort_unstable();
 				Ok(v.into())
 			}
 		},
@@ -97,7 +113,7 @@ pub mod sort {
 	pub fn asc((array,): (Value,)) -> Result<Value, Error> {
 		match array {
 			Value::Array(mut v) => {
-				v.sort_unstable_by(|a, b| a.cmp(b));
+				v.sort_unstable();
 				Ok(v.into())
 			}
 			v => Ok(v),
