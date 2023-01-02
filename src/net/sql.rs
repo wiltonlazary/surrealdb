@@ -7,12 +7,13 @@ use crate::net::params::Params;
 use crate::net::session;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use surrealdb::Session;
+use surrealdb::dbs::Session;
 use warp::ws::{Message, WebSocket, Ws};
 use warp::Filter;
 
 const MAX: u64 = 1024 * 1024; // 1 MiB
 
+#[allow(opaque_hidden_inferred_bound)]
 pub fn config() -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
 	// Set base path
 	let base = warp::path("sql").and(warp::path::end());

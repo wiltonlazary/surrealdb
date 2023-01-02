@@ -13,6 +13,7 @@ pub mod http;
 pub mod is;
 pub mod math;
 pub mod meta;
+pub mod not;
 pub mod operate;
 pub mod parse;
 pub mod rand;
@@ -65,6 +66,7 @@ pub fn synchronous(ctx: &Context<'_>, name: &str, args: Vec<Value>) -> Result<Va
 		"array::difference" => array::difference,
 		"array::distinct" => array::distinct,
 		"array::flatten" => array::flatten,
+		"array::insert" => array::insert,
 		"array::intersect" => array::intersect,
 		"array::len" => array::len,
 		"array::sort" => array::sort,
@@ -120,6 +122,7 @@ pub fn synchronous(ctx: &Context<'_>, name: &str, args: Vec<Value>) -> Result<Va
 		"math::mode" => math::mode,
 		"math::nearestrank" => math::nearestrank,
 		"math::percentile" => math::percentile,
+		"math::pow" => math::pow,
 		"math::product" => math::product,
 		"math::round" => math::round,
 		"math::spread" => math::spread,
@@ -133,6 +136,8 @@ pub fn synchronous(ctx: &Context<'_>, name: &str, args: Vec<Value>) -> Result<Va
 		"meta::id" => meta::id,
 		"meta::table" => meta::tb,
 		"meta::tb" => meta::tb,
+		//
+		"not" => not::not,
 		//
 		"parse::email::host" => parse::email::host,
 		"parse::email::user" => parse::email::user,

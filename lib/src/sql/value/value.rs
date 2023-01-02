@@ -698,6 +698,18 @@ impl Value {
 		matches!(self, Value::Number(v) if v.is_positive())
 	}
 
+	pub fn is_negative(&self) -> bool {
+		matches!(self, Value::Number(v) if v.is_negative())
+	}
+
+	pub fn is_zero_or_positive(&self) -> bool {
+		matches!(self, Value::Number(v) if v.is_zero_or_positive())
+	}
+
+	pub fn is_zero_or_negative(&self) -> bool {
+		matches!(self, Value::Number(v) if v.is_zero_or_negative())
+	}
+
 	pub fn is_datetime(&self) -> bool {
 		matches!(self, Value::Datetime(_))
 	}
@@ -1216,6 +1228,14 @@ impl Value {
 			(Value::Strand(a), Value::Strand(b)) => Some(lexical_sort::natural_lexical_cmp(a, b)),
 			_ => self.partial_cmp(other),
 		}
+	}
+
+	// -----------------------------------
+	// Mathematical operations
+	// -----------------------------------
+
+	pub fn pow(self, other: Value) -> Value {
+		self.as_number().pow(other.as_number()).into()
 	}
 }
 

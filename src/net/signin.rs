@@ -4,8 +4,8 @@ use crate::net::output;
 use crate::net::session;
 use bytes::Bytes;
 use serde::Serialize;
+use surrealdb::dbs::Session;
 use surrealdb::sql::Value;
-use surrealdb::Session;
 use warp::Filter;
 
 const MAX: u64 = 1024; // 1 KiB
@@ -27,6 +27,7 @@ impl Success {
 	}
 }
 
+#[allow(opaque_hidden_inferred_bound)]
 pub fn config() -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
 	// Set base path
 	let base = warp::path("signin").and(warp::path::end());

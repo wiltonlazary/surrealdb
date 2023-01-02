@@ -285,7 +285,7 @@ impl Transaction {
 				let (k, v) = (iter.key(), iter.value());
 				// Check the key and value
 				if let (Some(k), Some(v)) = (k, v) {
-					if k > beg && k < end {
+					if k >= beg && k < end {
 						res.push((k.to_vec(), v.to_vec()));
 						iter.next();
 						continue;
@@ -308,8 +308,8 @@ mod tests {
 		let mut transaction = get_transaction().await;
 		transaction.put("uh", "oh").await.unwrap();
 
-		async fn get_transaction() -> crate::Transaction {
-			let datastore = crate::Datastore::new("rocksdb:/tmp/rocks.db").await.unwrap();
+		async fn get_transaction() -> crate::kvs::Transaction {
+			let datastore = crate::kvs::Datastore::new("rocksdb:/tmp/rocks.db").await.unwrap();
 			datastore.transaction(true, false).await.unwrap()
 		}
 	}

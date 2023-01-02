@@ -16,6 +16,7 @@ use futures::lock::Mutex;
 use std::sync::Arc;
 
 /// The underlying datastore instance which stores the dataset.
+#[allow(dead_code)]
 pub struct Datastore {
 	pub(super) inner: Inner,
 }
@@ -40,8 +41,8 @@ impl Datastore {
 	/// # Examples
 	///
 	/// ```rust,no_run
-	/// # use surrealdb::Datastore;
-	/// # use surrealdb::Error;
+	/// # use surrealdb::kvs::Datastore;
+	/// # use surrealdb::err::Error;
 	/// # #[tokio::main]
 	/// # async fn main() -> Result<(), Error> {
 	/// let ds = Datastore::new("memory").await?;
@@ -52,8 +53,8 @@ impl Datastore {
 	/// Or to create a file-backed store:
 	///
 	/// ```rust,no_run
-	/// # use surrealdb::Datastore;
-	/// # use surrealdb::Error;
+	/// # use surrealdb::kvs::Datastore;
+	/// # use surrealdb::err::Error;
 	/// # #[tokio::main]
 	/// # async fn main() -> Result<(), Error> {
 	/// let ds = Datastore::new("file://temp.db").await?;
@@ -64,8 +65,8 @@ impl Datastore {
 	/// Or to connect to a tikv-backed distributed store:
 	///
 	/// ```rust,no_run
-	/// # use surrealdb::Datastore;
-	/// # use surrealdb::Error;
+	/// # use surrealdb::kvs::Datastore;
+	/// # use surrealdb::err::Error;
 	/// # #[tokio::main]
 	/// # async fn main() -> Result<(), Error> {
 	/// let ds = Datastore::new("tikv://127.0.0.1:2379").await?;
@@ -144,15 +145,18 @@ impl Datastore {
 				v
 			}
 			// The datastore path is not valid
-			_ => Err(Error::Ds("Unable to load the specified datastore".into())),
+			_ => {
+				info!(target: LOG, "Unable to load the specified datastore {}", path);
+				Err(Error::Ds("Unable to load the specified datastore".into()))
+			}
 		}
 	}
 
 	/// Create a new transaction on this datastore
 	///
 	/// ```rust,no_run
-	/// use surrealdb::Datastore;
-	/// use surrealdb::Error;
+	/// use surrealdb::kvs::Datastore;
+	/// use surrealdb::err::Error;
 	///
 	/// #[tokio::main]
 	/// async fn main() -> Result<(), Error> {
@@ -163,6 +167,7 @@ impl Datastore {
 	/// }
 	/// ```
 	pub async fn transaction(&self, write: bool, lock: bool) -> Result<Transaction, Error> {
+		#![allow(unused_variables)]
 		match &self.inner {
 			#[cfg(feature = "kv-mem")]
 			Inner::Mem(v) => {
@@ -204,15 +209,17 @@ impl Datastore {
 					cache: super::cache::Cache::default(),
 				})
 			}
+			#[allow(unreachable_patterns)]
+			_ => unreachable!(),
 		}
 	}
 
 	/// Parse and execute an SQL query
 	///
 	/// ```rust,no_run
-	/// use surrealdb::Datastore;
-	/// use surrealdb::Error;
-	/// use surrealdb::Session;
+	/// use surrealdb::kvs::Datastore;
+	/// use surrealdb::err::Error;
+	/// use surrealdb::dbs::Session;
 	///
 	/// #[tokio::main]
 	/// async fn main() -> Result<(), Error> {
@@ -258,9 +265,9 @@ impl Datastore {
 	/// Execute a pre-parsed SQL query
 	///
 	/// ```rust,no_run
-	/// use surrealdb::Datastore;
-	/// use surrealdb::Error;
-	/// use surrealdb::Session;
+	/// use surrealdb::kvs::Datastore;
+	/// use surrealdb::err::Error;
+	/// use surrealdb::dbs::Session;
 	/// use surrealdb::sql::parse;
 	///
 	/// #[tokio::main]
@@ -305,9 +312,9 @@ impl Datastore {
 	/// Ensure a SQL [`Value`] is fully computed
 	///
 	/// ```rust,no_run
-	/// use surrealdb::Datastore;
-	/// use surrealdb::Error;
-	/// use surrealdb::Session;
+	/// use surrealdb::kvs::Datastore;
+	/// use surrealdb::err::Error;
+	/// use surrealdb::dbs::Session;
 	/// use surrealdb::sql::Future;
 	/// use surrealdb::sql::Value;
 	///

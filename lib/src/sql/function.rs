@@ -113,6 +113,8 @@ impl Function {
 	) -> Result<Value, Error> {
 		// Prevent long function chains
 		let opt = &opt.dive(1)?;
+		// Ensure futures are run
+		let opt = &opt.futures(true);
 		// Process the function type
 		match self {
 			Self::Cast(s, x) => {
@@ -177,7 +179,9 @@ fn script(i: &str) -> IResult<&str, Function> {
 	let (i, _) = alt((tag("fn::script"), tag("fn"), tag("function")))(i)?;
 	let (i, _) = mightbespace(i)?;
 	let (i, _) = tag("(")(i)?;
+	let (i, _) = mightbespace(i)?;
 	let (i, a) = separated_list0(commas, value)(i)?;
+	let (i, _) = mightbespace(i)?;
 	let (i, _) = tag(")")(i)?;
 	let (i, _) = mightbespace(i)?;
 	let (i, _) = char('{')(i)?;
@@ -219,6 +223,7 @@ fn function_names(i: &str) -> IResult<&str, &str> {
 		function_is,
 		function_math,
 		function_meta,
+		function_not,
 		function_parse,
 		function_rand,
 		function_session,
@@ -236,6 +241,7 @@ fn function_array(i: &str) -> IResult<&str, &str> {
 		tag("array::difference"),
 		tag("array::flatten"),
 		tag("array::distinct"),
+		tag("array::insert"),
 		tag("array::intersect"),
 		tag("array::len"),
 		tag("array::sort::asc"),
@@ -337,6 +343,7 @@ fn function_math(i: &str) -> IResult<&str, &str> {
 		alt((
 			tag("math::nearestrank"),
 			tag("math::percentile"),
+			tag("math::pow"),
 			tag("math::product"),
 			tag("math::round"),
 			tag("math::spread"),
@@ -352,6 +359,10 @@ fn function_math(i: &str) -> IResult<&str, &str> {
 
 fn function_meta(i: &str) -> IResult<&str, &str> {
 	alt((tag("meta::id"), tag("meta::table"), tag("meta::tb")))(i)
+}
+
+fn function_not(i: &str) -> IResult<&str, &str> {
+	tag("not")(i)
 }
 
 fn function_parse(i: &str) -> IResult<&str, &str> {
@@ -469,6 +480,16 @@ mod tests {
 		let out = res.unwrap().1;
 		assert_eq!("count()", format!("{}", out));
 		assert_eq!(out, Function::Normal(String::from("count"), vec![]));
+	}
+
+	#[test]
+	fn function_single_not() {
+		let sql = "not(1.2345)";
+		let res = function(sql);
+		assert!(res.is_ok());
+		let out = res.unwrap().1;
+		assert_eq!("not(1.2345)", format!("{}", out));
+		assert_eq!(out, Function::Normal("not".to_owned(), vec![1.2345.into()]));
 	}
 
 	#[test]

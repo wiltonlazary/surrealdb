@@ -5,12 +5,13 @@ use crate::net::input::bytes_to_utf8;
 use crate::net::output;
 use crate::net::session;
 use bytes::Bytes;
-use surrealdb::Session;
+use surrealdb::dbs::Session;
 use warp::http;
 use warp::Filter;
 
 const MAX: u64 = 1024 * 1024 * 1024 * 4; // 4 GiB
 
+#[allow(opaque_hidden_inferred_bound)]
 pub fn config() -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
 	warp::path("import")
 		.and(warp::path::end())
