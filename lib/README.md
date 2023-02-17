@@ -45,7 +45,7 @@ use serde_json::json;
 use std::borrow::Cow;
 use surrealdb::sql;
 use surrealdb::Surreal;
-use surrealdb::engines::remote::ws::Ws;
+use surrealdb::engine::remote::ws::Ws;
 use surrealdb::opt::auth::Root;
 
 #[derive(Serialize, Deserialize)]
@@ -123,11 +123,11 @@ async fn main() -> surrealdb::Result<()> {
     assert!(!people.is_empty());
 
     // Perform a custom advanced query
-    let sql = sql! {
+    let sql = r#"
         SELECT marketing, count()
         FROM type::table($table)
         GROUP BY marketing
-    };
+    "#;
 
     let groups = db.query(sql)
         .bind(("table", "person"))

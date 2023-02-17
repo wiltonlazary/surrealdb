@@ -12,7 +12,7 @@ use crate::sql::duration::{duration, Duration};
 use crate::sql::edges::{edges, Edges};
 use crate::sql::error::IResult;
 use crate::sql::expression::{expression, Expression};
-use crate::sql::fmt::Fmt;
+use crate::sql::fmt::{Fmt, Pretty};
 use crate::sql::function::{function, Function};
 use crate::sql::future::{future, Future};
 use crate::sql::geometry::{geometry, Geometry};
@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::fmt::{self, Display, Formatter};
+use std::fmt::{self, Display, Formatter, Write};
 use std::ops;
 use std::ops::Deref;
 use std::str::FromStr;
@@ -152,12 +152,6 @@ impl From<bool> for Value {
 impl From<Uuid> for Value {
 	fn from(v: Uuid) -> Self {
 		Value::Uuid(v)
-	}
-}
-
-impl From<uuid::Uuid> for Value {
-	fn from(v: uuid::Uuid) -> Self {
-		Value::Uuid(Uuid(v))
 	}
 }
 
@@ -401,6 +395,12 @@ impl From<Operation> for Value {
 	}
 }
 
+impl From<uuid::Uuid> for Value {
+	fn from(v: uuid::Uuid) -> Self {
+		Value::Uuid(Uuid(v))
+	}
+}
+
 impl From<Vec<&str>> for Value {
 	fn from(v: Vec<&str>) -> Self {
 		Value::Array(Array::from(v))
@@ -601,12 +601,16 @@ impl Value {
 	// Simple value detection
 	// -----------------------------------
 
-	pub fn is_none(&self) -> bool {
+	pub fn is_none_or_null(&self) -> bool {
 		matches!(self, Value::None | Value::Null)
 	}
 
+	pub fn is_none(&self) -> bool {
+		matches!(self, Value::None)
+	}
+
 	pub fn is_null(&self) -> bool {
-		matches!(self, Value::None | Value::Null)
+		matches!(self, Value::Null)
 	}
 
 	pub fn is_some(&self) -> bool {
@@ -660,6 +664,10 @@ impl Value {
 
 	pub fn is_range(&self) -> bool {
 		matches!(self, Value::Range(_))
+	}
+
+	pub fn is_table(&self) -> bool {
+		matches!(self, Value::Table(_))
 	}
 
 	pub fn is_strand(&self) -> bool {
@@ -823,7 +831,9 @@ impl Value {
 
 	pub fn as_string(self) -> String {
 		match self {
-			Value::Strand(v) => v.as_string(),
+			Value::Strand(v) => v.0,
+			Value::Uuid(v) => v.to_raw(),
+			Value::Datetime(v) => v.to_raw(),
 			_ => self.to_string(),
 		}
 	}
@@ -832,6 +842,15 @@ impl Value {
 		match self {
 			Value::Number(v) => v.as_usize(),
 			_ => 0,
+		}
+	}
+
+	pub fn as_raw_string(self) -> String {
+		match self {
+			Value::Strand(v) => v.0,
+			Value::Uuid(v) => v.to_raw(),
+			Value::Datetime(v) => v.to_raw(),
+			_ => self.to_string(),
 		}
 	}
 
@@ -872,6 +891,15 @@ impl Value {
 			Value::Strand(v) => Duration::from(v.as_str()),
 			Value::Duration(v) => v.clone(),
 			_ => Duration::default(),
+		}
+	}
+
+	pub fn to_raw_string(&self) -> String {
+		match self {
+			Value::Strand(v) => v.0.to_owned(),
+			Value::Uuid(v) => v.to_raw(),
+			Value::Datetime(v) => v.to_raw(),
+			_ => self.to_string(),
 		}
 	}
 
@@ -1029,7 +1057,8 @@ impl Value {
 	// JSON Path conversion
 	// -----------------------------------
 
-	pub fn jsonpath(&self) -> Idiom {
+	/// Converts this value to a JSONPatch path
+	pub(crate) fn jsonpath(&self) -> Idiom {
 		self.to_strand()
 			.as_str()
 			.trim_start_matches('/')
@@ -1037,6 +1066,30 @@ impl Value {
 			.map(Part::from)
 			.collect::<Vec<Part>>()
 			.into()
+	}
+
+	// -----------------------------------
+	// JSON Path conversion
+	// -----------------------------------
+
+	/// Checkes whether this value is a static value
+	pub(crate) fn is_static(&self) -> bool {
+		match self {
+			Value::None => true,
+			Value::Null => true,
+			Value::False => true,
+			Value::True => true,
+			Value::Uuid(_) => true,
+			Value::Number(_) => true,
+			Value::Strand(_) => true,
+			Value::Duration(_) => true,
+			Value::Datetime(_) => true,
+			Value::Geometry(_) => true,
+			Value::Array(v) => v.iter().all(Value::is_static),
+			Value::Object(v) => v.values().all(Value::is_static),
+			Value::Constant(_) => true,
+			_ => false,
+		}
 	}
 
 	// -----------------------------------
@@ -1134,7 +1187,7 @@ impl Value {
 		match self {
 			Value::Strand(v) => match other {
 				Value::Strand(w) => MATCHER.fuzzy_match(v.as_str(), w.as_str()).is_some(),
-				_ => MATCHER.fuzzy_match(v.as_str(), other.to_string().as_str()).is_some(),
+				_ => MATCHER.fuzzy_match(v.as_str(), other.to_raw_string().as_str()).is_some(),
 			},
 			_ => self.equal(other),
 		}
@@ -1159,11 +1212,11 @@ impl Value {
 			Value::Array(v) => v.iter().any(|v| v.equal(other)),
 			Value::Thing(v) => match other {
 				Value::Strand(w) => v.to_string().contains(w.as_str()),
-				_ => v.to_string().contains(other.to_string().as_str()),
+				_ => v.to_string().contains(other.to_raw_string().as_str()),
 			},
 			Value::Strand(v) => match other {
 				Value::Strand(w) => v.contains(w.as_str()),
-				_ => v.contains(other.to_string().as_str()),
+				_ => v.contains(other.to_raw_string().as_str()),
 			},
 			Value::Geometry(v) => match other {
 				Value::Geometry(w) => v.contains(w),
@@ -1241,32 +1294,33 @@ impl Value {
 
 impl fmt::Display for Value {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		let mut f = Pretty::from(f);
 		match self {
 			Value::None => write!(f, "NONE"),
 			Value::Null => write!(f, "NULL"),
 			Value::True => write!(f, "true"),
 			Value::False => write!(f, "false"),
-			Value::Number(v) => write!(f, "{}", v),
-			Value::Strand(v) => write!(f, "{}", v),
-			Value::Duration(v) => write!(f, "{}", v),
-			Value::Datetime(v) => write!(f, "{}", v),
-			Value::Uuid(v) => write!(f, "{}", v),
-			Value::Array(v) => write!(f, "{}", v),
-			Value::Object(v) => write!(f, "{}", v),
-			Value::Geometry(v) => write!(f, "{}", v),
-			Value::Param(v) => write!(f, "{}", v),
-			Value::Idiom(v) => write!(f, "{}", v),
-			Value::Table(v) => write!(f, "{}", v),
-			Value::Thing(v) => write!(f, "{}", v),
-			Value::Model(v) => write!(f, "{}", v),
-			Value::Regex(v) => write!(f, "{}", v),
-			Value::Range(v) => write!(f, "{}", v),
-			Value::Edges(v) => write!(f, "{}", v),
-			Value::Future(v) => write!(f, "{}", v),
-			Value::Constant(v) => write!(f, "{}", v),
-			Value::Function(v) => write!(f, "{}", v),
-			Value::Subquery(v) => write!(f, "{}", v),
-			Value::Expression(v) => write!(f, "{}", v),
+			Value::Number(v) => write!(f, "{v}"),
+			Value::Strand(v) => write!(f, "{v}"),
+			Value::Duration(v) => write!(f, "{v}"),
+			Value::Datetime(v) => write!(f, "{v}"),
+			Value::Uuid(v) => write!(f, "{v}"),
+			Value::Array(v) => write!(f, "{v}"),
+			Value::Object(v) => write!(f, "{v}"),
+			Value::Geometry(v) => write!(f, "{v}"),
+			Value::Param(v) => write!(f, "{v}"),
+			Value::Idiom(v) => write!(f, "{v}"),
+			Value::Table(v) => write!(f, "{v}"),
+			Value::Thing(v) => write!(f, "{v}"),
+			Value::Model(v) => write!(f, "{v}"),
+			Value::Regex(v) => write!(f, "{v}"),
+			Value::Range(v) => write!(f, "{v}"),
+			Value::Edges(v) => write!(f, "{v}"),
+			Value::Future(v) => write!(f, "{v}"),
+			Value::Constant(v) => write!(f, "{v}"),
+			Value::Function(v) => write!(f, "{v}"),
+			Value::Subquery(v) => write!(f, "{v}"),
+			Value::Expression(v) => write!(f, "{v}"),
 		}
 	}
 }
@@ -1283,8 +1337,8 @@ impl Value {
 		}
 	}
 
-	#[cfg_attr(feature = "parallel", async_recursion)]
-	#[cfg_attr(not(feature = "parallel"), async_recursion(?Send))]
+	#[cfg_attr(not(target_arch = "wasm32"), async_recursion)]
+	#[cfg_attr(target_arch = "wasm32", async_recursion(?Send))]
 	pub(crate) async fn compute(
 		&self,
 		ctx: &Context<'_>,
@@ -1530,14 +1584,14 @@ mod tests {
 	#[test]
 	fn check_none() {
 		assert_eq!(true, Value::None.is_none());
-		assert_eq!(true, Value::Null.is_none());
+		assert_eq!(false, Value::Null.is_none());
 		assert_eq!(false, Value::from(1).is_none());
 	}
 
 	#[test]
 	fn check_null() {
-		assert_eq!(true, Value::None.is_null());
 		assert_eq!(true, Value::Null.is_null());
+		assert_eq!(false, Value::None.is_null());
 		assert_eq!(false, Value::from(1).is_null());
 	}
 
@@ -1681,7 +1735,7 @@ mod tests {
 		assert_eq!(24, std::mem::size_of::<crate::sql::idiom::Idiom>());
 		assert_eq!(24, std::mem::size_of::<crate::sql::table::Table>());
 		assert_eq!(56, std::mem::size_of::<crate::sql::thing::Thing>());
-		assert_eq!(40, std::mem::size_of::<crate::sql::model::Model>());
+		assert_eq!(48, std::mem::size_of::<crate::sql::model::Model>());
 		assert_eq!(24, std::mem::size_of::<crate::sql::regex::Regex>());
 		assert_eq!(8, std::mem::size_of::<Box<crate::sql::range::Range>>());
 		assert_eq!(8, std::mem::size_of::<Box<crate::sql::edges::Edges>>());

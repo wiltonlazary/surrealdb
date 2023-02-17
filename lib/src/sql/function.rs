@@ -9,6 +9,7 @@ use crate::sql::error::IResult;
 use crate::sql::fmt::Fmt;
 use crate::sql::script::{script as func, Script};
 use crate::sql::value::{single, value, Value};
+use futures::future::try_join_all;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::char;
@@ -77,9 +78,8 @@ impl Function {
 	/// Check if this function is a grouping function
 	pub fn is_aggregate(&self) -> bool {
 		match self {
-			Self::Normal(f, _) if f == "array::concat" => true,
 			Self::Normal(f, _) if f == "array::distinct" => true,
-			Self::Normal(f, _) if f == "array::union" => true,
+			Self::Normal(f, _) if f == "array::group" => true,
 			Self::Normal(f, _) if f == "count" => true,
 			Self::Normal(f, _) if f == "math::bottom" => true,
 			Self::Normal(f, _) if f == "math::interquartile" => true,
@@ -118,25 +118,25 @@ impl Function {
 		// Process the function type
 		match self {
 			Self::Cast(s, x) => {
-				let v = x.compute(ctx, opt, txn, doc).await?;
-				fnc::cast::run(ctx, s, v)
+				// Compute the value to be cast
+				let a = x.compute(ctx, opt, txn, doc).await?;
+				// Run the cast function
+				fnc::cast::run(ctx, s, a)
 			}
 			Self::Normal(s, x) => {
-				let mut a: Vec<Value> = Vec::with_capacity(x.len());
-				for v in x {
-					a.push(v.compute(ctx, opt, txn, doc).await?);
-				}
+				// Compute the function arguments
+				let a = try_join_all(x.iter().map(|v| v.compute(ctx, opt, txn, doc))).await?;
+				// Run the normal function
 				fnc::run(ctx, s, a).await
 			}
 			#[allow(unused_variables)]
 			Self::Script(s, x) => {
 				#[cfg(feature = "scripting")]
 				{
-					let mut a: Vec<Value> = Vec::with_capacity(x.len());
-					for v in x {
-						a.push(v.compute(ctx, opt, txn, doc).await?);
-					}
-					fnc::script::run(ctx, doc, s, a).await
+					// Compute the function arguments
+					let a = try_join_all(x.iter().map(|v| v.compute(ctx, opt, txn, doc))).await?;
+					// Run the script function
+					fnc::script::run(ctx, opt, txn, doc, s, a).await
 				}
 				#[cfg(not(feature = "scripting"))]
 				{
@@ -152,11 +152,11 @@ impl Function {
 impl fmt::Display for Function {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		match self {
-			Self::Cast(ref s, ref e) => write!(f, "<{}> {}", s, e),
+			Self::Cast(ref s, ref e) => write!(f, "<{s}> {e}"),
 			Self::Script(ref s, ref e) => {
-				write!(f, "function({}) {{{}}}", Fmt::comma_separated(e), s)
+				write!(f, "function({}) {{{s}}}", Fmt::comma_separated(e))
 			}
-			Self::Normal(ref s, ref e) => write!(f, "{}({})", s, Fmt::comma_separated(e)),
+			Self::Normal(ref s, ref e) => write!(f, "{s}({})", Fmt::comma_separated(e)),
 		}
 	}
 }
@@ -235,15 +235,20 @@ fn function_names(i: &str) -> IResult<&str, &str> {
 
 fn function_array(i: &str) -> IResult<&str, &str> {
 	alt((
+		tag("array::all"),
+		tag("array::any"),
 		tag("array::combine"),
 		tag("array::complement"),
 		tag("array::concat"),
 		tag("array::difference"),
-		tag("array::flatten"),
 		tag("array::distinct"),
+		tag("array::flatten"),
+		tag("array::group"),
 		tag("array::insert"),
 		tag("array::intersect"),
 		tag("array::len"),
+		tag("array::max"),
+		tag("array::min"),
 		tag("array::sort::asc"),
 		tag("array::sort::desc"),
 		tag("array::sort"),
@@ -310,6 +315,7 @@ fn function_is(i: &str) -> IResult<&str, &str> {
 		tag("is::alphanum"),
 		tag("is::alpha"),
 		tag("is::ascii"),
+		tag("is::datetime"),
 		tag("is::domain"),
 		tag("is::email"),
 		tag("is::hexadecimal"),
@@ -372,8 +378,8 @@ fn function_parse(i: &str) -> IResult<&str, &str> {
 		tag("parse::url::domain"),
 		tag("parse::url::fragment"),
 		tag("parse::url::host"),
-		tag("parse::url::port"),
 		tag("parse::url::path"),
+		tag("parse::url::port"),
 		tag("parse::url::query"),
 		tag("parse::url::scheme"),
 	))(i)
@@ -388,6 +394,7 @@ fn function_rand(i: &str) -> IResult<&str, &str> {
 		tag("rand::int"),
 		tag("rand::string"),
 		tag("rand::time"),
+		tag("rand::ulid"),
 		tag("rand::uuid::v4"),
 		tag("rand::uuid::v7"),
 		tag("rand::uuid"),
@@ -441,6 +448,7 @@ fn function_time(i: &str) -> IResult<&str, &str> {
 		tag("time::now"),
 		tag("time::round"),
 		tag("time::second"),
+		tag("time::timezone"),
 		tag("time::unix"),
 		tag("time::wday"),
 		tag("time::week"),

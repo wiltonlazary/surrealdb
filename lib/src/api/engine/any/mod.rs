@@ -7,7 +7,7 @@
 //! use serde_json::json;
 //! use std::borrow::Cow;
 //! use surrealdb::sql;
-//! use surrealdb::engines::any::connect;
+//! use surrealdb::engine::any::connect;
 //! use surrealdb::opt::auth::Root;
 //!
 //! #[derive(Serialize, Deserialize)]
@@ -69,11 +69,11 @@
 //!     let people: Vec<Person> = db.select("person").await?;
 //!
 //!     // Perform a custom advanced query
-//!     let sql = sql! {
+//!     let sql = r#"
 //!         SELECT marketing, count()
 //!         FROM type::table($table)
 //!         GROUP BY marketing
-//!     };
+//!     "#;
 //!
 //!     let groups = db.query(sql)
 //!         .bind(("table", "person"))
@@ -232,7 +232,7 @@ impl Surreal<Any> {
 	///
 	/// ```no_run
 	/// use surrealdb::Surreal;
-	/// use surrealdb::engines::any::Any;
+	/// use surrealdb::engine::any::Any;
 	///
 	/// static DB: Surreal<Any> = Surreal::init();
 	///
@@ -258,7 +258,7 @@ impl Surreal<Any> {
 /// # Examples
 ///
 /// ```no_run
-/// use surrealdb::engines::any::connect;
+/// use surrealdb::engine::any::connect;
 ///
 /// # #[tokio::main]
 /// # async fn main() -> surrealdb::Result<()> {

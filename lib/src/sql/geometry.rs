@@ -7,11 +7,12 @@ use crate::sql::fmt::Fmt;
 use crate::sql::serde::is_internal_serialization;
 use geo::algorithm::contains::Contains;
 use geo::algorithm::intersects::Intersects;
-use geo::{LineString, Point, Polygon};
+use geo::{Coord, LineString, Point, Polygon};
 use geo::{MultiLineString, MultiPoint, MultiPolygon};
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::char;
+use nom::combinator::opt;
 use nom::multi::separated_list0;
 use nom::multi::separated_list1;
 use nom::number::complete::double;
@@ -20,7 +21,7 @@ use nom::sequence::preceded;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::iter::FromIterator;
+use std::iter::{once, FromIterator};
 use std::{fmt, hash};
 
 const SINGLE: char = '\'';
@@ -38,9 +39,95 @@ pub enum Geometry {
 }
 
 impl PartialOrd for Geometry {
-	#[inline]
-	fn partial_cmp(&self, _: &Self) -> Option<Ordering> {
-		None
+	#[rustfmt::skip]
+	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+		fn coord(coord: &Coord) -> (f64, f64) {
+			coord.x_y()
+		}
+
+		fn point(point: &Point) -> (f64, f64) {
+			coord(&point.0)
+		}
+
+		fn line(line: &LineString) -> impl Iterator<Item = (f64, f64)> + '_ {
+			line.into_iter().map(coord)
+		}
+
+		fn polygon(polygon: &Polygon) -> impl Iterator<Item = (f64, f64)> + '_ {
+			polygon.interiors().iter().chain(once(polygon.exterior())).flat_map(line)
+		}
+
+		fn multi_point(multi_point: &MultiPoint) -> impl Iterator<Item = (f64, f64)> + '_ {
+			multi_point.iter().map(point)
+		}
+
+		fn multi_line(multi_line: &MultiLineString) -> impl Iterator<Item = (f64, f64)> + '_ {
+			multi_line.iter().flat_map(line)
+		}
+
+		fn multi_polygon(multi_polygon: &MultiPolygon) -> impl Iterator<Item = (f64, f64)> + '_ {
+			multi_polygon.iter().flat_map(polygon)
+		}
+
+		match (self, other) {
+			//
+			(Self::Point(_), Self::Line(_)) => Some(Ordering::Less),
+			(Self::Point(_), Self::Polygon(_)) => Some(Ordering::Less),
+			(Self::Point(_), Self::MultiPoint(_)) => Some(Ordering::Less),
+			(Self::Point(_), Self::MultiLine(_)) => Some(Ordering::Less),
+			(Self::Point(_), Self::MultiPolygon(_)) => Some(Ordering::Less),
+			(Self::Point(_), Self::Collection(_)) => Some(Ordering::Less),
+			//
+			(Self::Line(_), Self::Point(_)) => Some(Ordering::Greater),
+			(Self::Line(_), Self::Polygon(_)) => Some(Ordering::Less),
+			(Self::Line(_), Self::MultiPoint(_)) => Some(Ordering::Less),
+			(Self::Line(_), Self::MultiLine(_)) => Some(Ordering::Less),
+			(Self::Line(_), Self::MultiPolygon(_)) => Some(Ordering::Less),
+			(Self::Line(_), Self::Collection(_)) => Some(Ordering::Less),
+			//
+			(Self::Polygon(_), Self::Point(_)) => Some(Ordering::Greater),
+			(Self::Polygon(_), Self::Line(_)) => Some(Ordering::Greater),
+			(Self::Polygon(_), Self::MultiPoint(_)) => Some(Ordering::Less),
+			(Self::Polygon(_), Self::MultiLine(_)) => Some(Ordering::Less),
+			(Self::Polygon(_), Self::MultiPolygon(_)) => Some(Ordering::Less),
+			(Self::Polygon(_), Self::Collection(_)) => Some(Ordering::Less),
+			//
+			(Self::MultiPoint(_), Self::Point(_)) => Some(Ordering::Greater),
+			(Self::MultiPoint(_), Self::Line(_)) => Some(Ordering::Greater),
+			(Self::MultiPoint(_), Self::Polygon(_)) => Some(Ordering::Greater),
+			(Self::MultiPoint(_), Self::MultiLine(_)) => Some(Ordering::Less),
+			(Self::MultiPoint(_), Self::MultiPolygon(_)) => Some(Ordering::Less),
+			(Self::MultiPoint(_), Self::Collection(_)) => Some(Ordering::Less),
+			//
+			(Self::MultiLine(_), Self::Point(_)) => Some(Ordering::Greater),
+			(Self::MultiLine(_), Self::Line(_)) => Some(Ordering::Greater),
+			(Self::MultiLine(_), Self::Polygon(_)) => Some(Ordering::Greater),
+			(Self::MultiLine(_), Self::MultiPoint(_)) => Some(Ordering::Greater),
+			(Self::MultiLine(_), Self::MultiPolygon(_)) => Some(Ordering::Less),
+			(Self::MultiLine(_), Self::Collection(_)) => Some(Ordering::Less),
+			//
+			(Self::MultiPolygon(_), Self::Point(_)) => Some(Ordering::Greater),
+			(Self::MultiPolygon(_), Self::Line(_)) => Some(Ordering::Greater),
+			(Self::MultiPolygon(_), Self::Polygon(_)) => Some(Ordering::Greater),
+			(Self::MultiPolygon(_), Self::MultiPoint(_)) => Some(Ordering::Greater),
+			(Self::MultiPolygon(_), Self::MultiLine(_)) => Some(Ordering::Greater),
+			(Self::MultiPolygon(_), Self::Collection(_)) => Some(Ordering::Less),
+			//
+			(Self::Collection(_), Self::Point(_)) => Some(Ordering::Greater),
+			(Self::Collection(_), Self::Line(_)) => Some(Ordering::Greater),
+			(Self::Collection(_), Self::Polygon(_)) => Some(Ordering::Greater),
+			(Self::Collection(_), Self::MultiPoint(_)) => Some(Ordering::Greater),
+			(Self::Collection(_), Self::MultiLine(_)) => Some(Ordering::Greater),
+			(Self::Collection(_), Self::MultiPolygon(_)) => Some(Ordering::Greater),
+			//
+			(Self::Point(a), Self::Point(b)) => point(a).partial_cmp(&point(b)),
+			(Self::Line(a), Self::Line(b)) => line(a).partial_cmp(line(b)),
+			(Self::Polygon(a), Self::Polygon(b)) => polygon(a).partial_cmp(polygon(b)),
+			(Self::MultiPoint(a), Self::MultiPoint(b)) => multi_point(a).partial_cmp(multi_point(b)),
+			(Self::MultiLine(a), Self::MultiLine(b)) => multi_line(a).partial_cmp(multi_line(b)),
+			(Self::MultiPolygon(a), Self::MultiPolygon(b)) => multi_polygon(a).partial_cmp(multi_polygon(b)),
+			(Self::Collection(a), Self::Collection(b)) => a.partial_cmp(b),
+		}
 	}
 }
 
@@ -591,9 +678,7 @@ fn simple(i: &str) -> IResult<&str, Geometry> {
 	let (i, _) = char('(')(i)?;
 	let (i, _) = mightbespace(i)?;
 	let (i, x) = double(i)?;
-	let (i, _) = mightbespace(i)?;
-	let (i, _) = char(',')(i)?;
-	let (i, _) = mightbespace(i)?;
+	let (i, _) = commas(i)?;
 	let (i, y) = double(i)?;
 	let (i, _) = mightbespace(i)?;
 	let (i, _) = char(')')(i)?;
@@ -606,14 +691,20 @@ fn point(i: &str) -> IResult<&str, Geometry> {
 	let (i, v) = alt((
 		|i| {
 			let (i, _) = preceded(key_type, point_type)(i)?;
-			let (i, _) = delimited(mightbespace, char(','), mightbespace)(i)?;
+			let (i, _) = commas(i)?;
 			let (i, v) = preceded(key_vals, point_vals)(i)?;
+			let (i, _) = mightbespace(i)?;
+			let (i, _) = opt(char(','))(i)?;
+			let (i, _) = mightbespace(i)?;
 			Ok((i, v))
 		},
 		|i| {
 			let (i, v) = preceded(key_vals, point_vals)(i)?;
-			let (i, _) = delimited(mightbespace, char(','), mightbespace)(i)?;
+			let (i, _) = commas(i)?;
 			let (i, _) = preceded(key_type, point_type)(i)?;
+			let (i, _) = mightbespace(i)?;
+			let (i, _) = opt(char(','))(i)?;
+			let (i, _) = mightbespace(i)?;
 			Ok((i, v))
 		},
 	))(i)?;
@@ -628,14 +719,20 @@ fn line(i: &str) -> IResult<&str, Geometry> {
 	let (i, v) = alt((
 		|i| {
 			let (i, _) = preceded(key_type, line_type)(i)?;
-			let (i, _) = delimited(mightbespace, char(','), mightbespace)(i)?;
+			let (i, _) = commas(i)?;
 			let (i, v) = preceded(key_vals, line_vals)(i)?;
+			let (i, _) = mightbespace(i)?;
+			let (i, _) = opt(char(','))(i)?;
+			let (i, _) = mightbespace(i)?;
 			Ok((i, v))
 		},
 		|i| {
 			let (i, v) = preceded(key_vals, line_vals)(i)?;
-			let (i, _) = delimited(mightbespace, char(','), mightbespace)(i)?;
+			let (i, _) = commas(i)?;
 			let (i, _) = preceded(key_type, line_type)(i)?;
+			let (i, _) = mightbespace(i)?;
+			let (i, _) = opt(char(','))(i)?;
+			let (i, _) = mightbespace(i)?;
 			Ok((i, v))
 		},
 	))(i)?;
@@ -650,14 +747,20 @@ fn polygon(i: &str) -> IResult<&str, Geometry> {
 	let (i, v) = alt((
 		|i| {
 			let (i, _) = preceded(key_type, polygon_type)(i)?;
-			let (i, _) = delimited(mightbespace, char(','), mightbespace)(i)?;
+			let (i, _) = commas(i)?;
 			let (i, v) = preceded(key_vals, polygon_vals)(i)?;
+			let (i, _) = mightbespace(i)?;
+			let (i, _) = opt(char(','))(i)?;
+			let (i, _) = mightbespace(i)?;
 			Ok((i, v))
 		},
 		|i| {
 			let (i, v) = preceded(key_vals, polygon_vals)(i)?;
-			let (i, _) = delimited(mightbespace, char(','), mightbespace)(i)?;
+			let (i, _) = commas(i)?;
 			let (i, _) = preceded(key_type, polygon_type)(i)?;
+			let (i, _) = mightbespace(i)?;
+			let (i, _) = opt(char(','))(i)?;
+			let (i, _) = mightbespace(i)?;
 			Ok((i, v))
 		},
 	))(i)?;
@@ -672,14 +775,20 @@ fn multipoint(i: &str) -> IResult<&str, Geometry> {
 	let (i, v) = alt((
 		|i| {
 			let (i, _) = preceded(key_type, multipoint_type)(i)?;
-			let (i, _) = delimited(mightbespace, char(','), mightbespace)(i)?;
+			let (i, _) = commas(i)?;
 			let (i, v) = preceded(key_vals, multipoint_vals)(i)?;
+			let (i, _) = mightbespace(i)?;
+			let (i, _) = opt(char(','))(i)?;
+			let (i, _) = mightbespace(i)?;
 			Ok((i, v))
 		},
 		|i| {
 			let (i, v) = preceded(key_vals, multipoint_vals)(i)?;
-			let (i, _) = delimited(mightbespace, char(','), mightbespace)(i)?;
+			let (i, _) = commas(i)?;
 			let (i, _) = preceded(key_type, multipoint_type)(i)?;
+			let (i, _) = mightbespace(i)?;
+			let (i, _) = opt(char(','))(i)?;
+			let (i, _) = mightbespace(i)?;
 			Ok((i, v))
 		},
 	))(i)?;
@@ -694,14 +803,20 @@ fn multiline(i: &str) -> IResult<&str, Geometry> {
 	let (i, v) = alt((
 		|i| {
 			let (i, _) = preceded(key_type, multiline_type)(i)?;
-			let (i, _) = delimited(mightbespace, char(','), mightbespace)(i)?;
+			let (i, _) = commas(i)?;
 			let (i, v) = preceded(key_vals, multiline_vals)(i)?;
+			let (i, _) = mightbespace(i)?;
+			let (i, _) = opt(char(','))(i)?;
+			let (i, _) = mightbespace(i)?;
 			Ok((i, v))
 		},
 		|i| {
 			let (i, v) = preceded(key_vals, multiline_vals)(i)?;
-			let (i, _) = delimited(mightbespace, char(','), mightbespace)(i)?;
+			let (i, _) = commas(i)?;
 			let (i, _) = preceded(key_type, multiline_type)(i)?;
+			let (i, _) = mightbespace(i)?;
+			let (i, _) = opt(char(','))(i)?;
+			let (i, _) = mightbespace(i)?;
 			Ok((i, v))
 		},
 	))(i)?;
@@ -716,14 +831,20 @@ fn multipolygon(i: &str) -> IResult<&str, Geometry> {
 	let (i, v) = alt((
 		|i| {
 			let (i, _) = preceded(key_type, multipolygon_type)(i)?;
-			let (i, _) = delimited(mightbespace, char(','), mightbespace)(i)?;
+			let (i, _) = commas(i)?;
 			let (i, v) = preceded(key_vals, multipolygon_vals)(i)?;
+			let (i, _) = mightbespace(i)?;
+			let (i, _) = opt(char(','))(i)?;
+			let (i, _) = mightbespace(i)?;
 			Ok((i, v))
 		},
 		|i| {
 			let (i, v) = preceded(key_vals, multipolygon_vals)(i)?;
-			let (i, _) = delimited(mightbespace, char(','), mightbespace)(i)?;
+			let (i, _) = commas(i)?;
 			let (i, _) = preceded(key_type, multipolygon_type)(i)?;
+			let (i, _) = mightbespace(i)?;
+			let (i, _) = opt(char(','))(i)?;
+			let (i, _) = mightbespace(i)?;
 			Ok((i, v))
 		},
 	))(i)?;
@@ -738,14 +859,20 @@ fn collection(i: &str) -> IResult<&str, Geometry> {
 	let (i, v) = alt((
 		|i| {
 			let (i, _) = preceded(key_type, collection_type)(i)?;
-			let (i, _) = delimited(mightbespace, char(','), mightbespace)(i)?;
+			let (i, _) = commas(i)?;
 			let (i, v) = preceded(key_geom, collection_vals)(i)?;
+			let (i, _) = mightbespace(i)?;
+			let (i, _) = opt(char(','))(i)?;
+			let (i, _) = mightbespace(i)?;
 			Ok((i, v))
 		},
 		|i| {
 			let (i, v) = preceded(key_geom, collection_vals)(i)?;
-			let (i, _) = delimited(mightbespace, char(','), mightbespace)(i)?;
+			let (i, _) = commas(i)?;
 			let (i, _) = preceded(key_type, collection_type)(i)?;
+			let (i, _) = mightbespace(i)?;
+			let (i, _) = opt(char(','))(i)?;
+			let (i, _) = mightbespace(i)?;
 			Ok((i, v))
 		},
 	))(i)?;
@@ -768,6 +895,8 @@ fn line_vals(i: &str) -> IResult<&str, LineString<f64>> {
 	let (i, _) = mightbespace(i)?;
 	let (i, v) = separated_list1(commas, coordinate)(i)?;
 	let (i, _) = mightbespace(i)?;
+	let (i, _) = opt(char(','))(i)?;
+	let (i, _) = mightbespace(i)?;
 	let (i, _) = char(']')(i)?;
 	Ok((i, v.into()))
 }
@@ -777,11 +906,15 @@ fn polygon_vals(i: &str) -> IResult<&str, Polygon<f64>> {
 	let (i, _) = mightbespace(i)?;
 	let (i, e) = line_vals(i)?;
 	let (i, _) = mightbespace(i)?;
+	let (i, _) = opt(char(','))(i)?;
+	let (i, _) = mightbespace(i)?;
 	let (i, _) = char(']')(i)?;
 	let (i, v) = separated_list0(commas, |i| {
 		let (i, _) = char('[')(i)?;
 		let (i, _) = mightbespace(i)?;
 		let (i, v) = line_vals(i)?;
+		let (i, _) = mightbespace(i)?;
+		let (i, _) = opt(char(','))(i)?;
 		let (i, _) = mightbespace(i)?;
 		let (i, _) = char(']')(i)?;
 		Ok((i, v))
@@ -794,6 +927,8 @@ fn multipoint_vals(i: &str) -> IResult<&str, Vec<Point<f64>>> {
 	let (i, _) = mightbespace(i)?;
 	let (i, v) = separated_list1(commas, point_vals)(i)?;
 	let (i, _) = mightbespace(i)?;
+	let (i, _) = opt(char(','))(i)?;
+	let (i, _) = mightbespace(i)?;
 	let (i, _) = char(']')(i)?;
 	Ok((i, v))
 }
@@ -802,6 +937,8 @@ fn multiline_vals(i: &str) -> IResult<&str, Vec<LineString<f64>>> {
 	let (i, _) = char('[')(i)?;
 	let (i, _) = mightbespace(i)?;
 	let (i, v) = separated_list1(commas, line_vals)(i)?;
+	let (i, _) = mightbespace(i)?;
+	let (i, _) = opt(char(','))(i)?;
 	let (i, _) = mightbespace(i)?;
 	let (i, _) = char(']')(i)?;
 	Ok((i, v))
@@ -812,6 +949,8 @@ fn multipolygon_vals(i: &str) -> IResult<&str, Vec<Polygon<f64>>> {
 	let (i, _) = mightbespace(i)?;
 	let (i, v) = separated_list1(commas, polygon_vals)(i)?;
 	let (i, _) = mightbespace(i)?;
+	let (i, _) = opt(char(','))(i)?;
+	let (i, _) = mightbespace(i)?;
 	let (i, _) = char(']')(i)?;
 	Ok((i, v))
 }
@@ -820,6 +959,8 @@ fn collection_vals(i: &str) -> IResult<&str, Vec<Geometry>> {
 	let (i, _) = char('[')(i)?;
 	let (i, _) = mightbespace(i)?;
 	let (i, v) = separated_list1(commas, geometry)(i)?;
+	let (i, _) = mightbespace(i)?;
+	let (i, _) = opt(char(','))(i)?;
 	let (i, _) = mightbespace(i)?;
 	let (i, _) = char(']')(i)?;
 	Ok((i, v))

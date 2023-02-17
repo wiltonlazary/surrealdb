@@ -25,6 +25,7 @@ To set up a working **development environment**, you can either [use the Nix pac
 > Please note that these instructions are for setting up a functional dev environment. If you just want to install SurrealDB for day-to-day usage and not as a code maintainer use this [installation guide](https://surrealdb.com/docs/install). If you want to get started integrating SurrealDB into your app, view the [integration tutorials](https://surrealdb.com/docs/integration).
 
 ```bash
+# Use the default (stable) release channel if prompted
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 git clone git@github.com:[YOUR_FORK_HERE]/surrealdb.git
 cd surrealdb
@@ -92,7 +93,7 @@ Please avoid introducing new dependencies to SurrealDB without consulting the te
 
 We would &nbsp;<img width="15" src="/img/love.svg">&nbsp; you to contribute to SurrealDB, but we would also like to make sure SurrealDB is as great as possible and loyal to its vision and mission statement. For us to find the right balance, please open a question on [GitHub discussions](https://github.com/surrealdb/surrealdb/discussions) with any ideas before introducing a new pull request. This will allow the SurrealDB community to have sufficient discussion about the new feature value and how it fits in the product roadmap and vision.
 
-This is also important for the SurrealDB lead developers to be able to give technical input and different emphasis regarding the feature design and architecture. Some bigger features might need to go through our [RFC process](https://github.com/surrealdb/rfc).
+This is also important for the SurrealDB lead developers to be able to give technical input and different emphasis regarding the feature design and architecture. Some bigger features might need to go through our [RFC process](https://github.com/surrealdb/rfcs).
 
 ## Submitting a pull request
 

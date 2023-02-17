@@ -14,6 +14,9 @@ use crate::sql::field::{fields, Field, Fields};
 use crate::sql::group::{group, Groups};
 use crate::sql::limit::{limit, Limit};
 use crate::sql::order::{order, Orders};
+use crate::sql::special::check_group_by_fields;
+use crate::sql::special::check_order_by_fields;
+use crate::sql::special::check_split_on_fields;
 use crate::sql::split::{split, Splits};
 use crate::sql::start::{start, Start};
 use crate::sql::timeout::{timeout, Timeout};
@@ -127,31 +130,31 @@ impl fmt::Display for SelectStatement {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		write!(f, "SELECT {} FROM {}", self.expr, self.what)?;
 		if let Some(ref v) = self.cond {
-			write!(f, " {}", v)?
+			write!(f, " {v}")?
 		}
 		if let Some(ref v) = self.split {
-			write!(f, " {}", v)?
+			write!(f, " {v}")?
 		}
 		if let Some(ref v) = self.group {
-			write!(f, " {}", v)?
+			write!(f, " {v}")?
 		}
 		if let Some(ref v) = self.order {
-			write!(f, " {}", v)?
+			write!(f, " {v}")?
 		}
 		if let Some(ref v) = self.limit {
-			write!(f, " {}", v)?
+			write!(f, " {v}")?
 		}
 		if let Some(ref v) = self.start {
-			write!(f, " {}", v)?
+			write!(f, " {v}")?
 		}
 		if let Some(ref v) = self.fetch {
-			write!(f, " {}", v)?
+			write!(f, " {v}")?
 		}
 		if let Some(ref v) = self.version {
-			write!(f, " {}", v)?
+			write!(f, " {v}")?
 		}
 		if let Some(ref v) = self.timeout {
-			write!(f, " {}", v)?
+			write!(f, " {v}")?
 		}
 		if self.parallel {
 			f.write_str(" PARALLEL")?
@@ -170,8 +173,11 @@ pub fn select(i: &str) -> IResult<&str, SelectStatement> {
 	let (i, what) = selects(i)?;
 	let (i, cond) = opt(preceded(shouldbespace, cond))(i)?;
 	let (i, split) = opt(preceded(shouldbespace, split))(i)?;
+	check_split_on_fields(i, &expr, &split)?;
 	let (i, group) = opt(preceded(shouldbespace, group))(i)?;
+	check_group_by_fields(i, &expr, &group)?;
 	let (i, order) = opt(preceded(shouldbespace, order))(i)?;
+	check_order_by_fields(i, &expr, &order)?;
 	let (i, limit) = opt(preceded(shouldbespace, limit))(i)?;
 	let (i, start) = opt(preceded(shouldbespace, start))(i)?;
 	let (i, fetch) = opt(preceded(shouldbespace, fetch))(i)?;

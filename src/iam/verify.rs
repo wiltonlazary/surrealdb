@@ -1,6 +1,7 @@
 use crate::cli::CF;
 use crate::dbs::DB;
 use crate::err::Error;
+use crate::iam::base::{Engine, BASE64};
 use crate::iam::token::Claims;
 use crate::iam::BASIC;
 use crate::iam::LOG;
@@ -93,7 +94,7 @@ pub async fn basic(session: &mut Session, auth: String) -> Result<(), Error> {
 	// Get the config options
 	let opts = CF.get().unwrap();
 	// Decode the encoded auth data
-	let auth = base64::decode(auth)?;
+	let auth = BASE64.decode(auth)?;
 	// Convert the auth data to String
 	let auth = String::from_utf8(auth)?;
 	// Split the auth data into user and pass

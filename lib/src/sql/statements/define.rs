@@ -9,6 +9,8 @@ use crate::sql::comment::shouldbespace;
 use crate::sql::duration::{duration, Duration};
 use crate::sql::error::IResult;
 use crate::sql::escape::escape_str;
+use crate::sql::fmt::is_pretty;
+use crate::sql::fmt::pretty_indent;
 use crate::sql::ident::{ident, Ident};
 use crate::sql::idiom;
 use crate::sql::idiom::{Idiom, Idioms};
@@ -23,6 +25,7 @@ use argon2::Argon2;
 use derive::Store;
 use nom::branch::alt;
 use nom::bytes::complete::tag_no_case;
+use nom::character::complete::char;
 use nom::combinator::{map, opt};
 use nom::multi::many0;
 use nom::sequence::tuple;
@@ -30,8 +33,7 @@ use rand::distributions::Alphanumeric;
 use rand::rngs::OsRng;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::fmt;
-use std::fmt::Display;
+use std::fmt::{self, Display, Write};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Store, Hash)]
 pub enum DefineStatement {
@@ -40,6 +42,7 @@ pub enum DefineStatement {
 	Login(DefineLoginStatement),
 	Token(DefineTokenStatement),
 	Scope(DefineScopeStatement),
+	Param(DefineParamStatement),
 	Table(DefineTableStatement),
 	Event(DefineEventStatement),
 	Field(DefineFieldStatement),
@@ -60,6 +63,7 @@ impl DefineStatement {
 			Self::Login(ref v) => v.compute(ctx, opt, txn, doc).await,
 			Self::Token(ref v) => v.compute(ctx, opt, txn, doc).await,
 			Self::Scope(ref v) => v.compute(ctx, opt, txn, doc).await,
+			Self::Param(ref v) => v.compute(ctx, opt, txn, doc).await,
 			Self::Table(ref v) => v.compute(ctx, opt, txn, doc).await,
 			Self::Event(ref v) => v.compute(ctx, opt, txn, doc).await,
 			Self::Field(ref v) => v.compute(ctx, opt, txn, doc).await,
@@ -76,6 +80,7 @@ impl fmt::Display for DefineStatement {
 			Self::Login(v) => Display::fmt(v, f),
 			Self::Token(v) => Display::fmt(v, f),
 			Self::Scope(v) => Display::fmt(v, f),
+			Self::Param(v) => Display::fmt(v, f),
 			Self::Table(v) => Display::fmt(v, f),
 			Self::Event(v) => Display::fmt(v, f),
 			Self::Field(v) => Display::fmt(v, f),
@@ -91,6 +96,7 @@ pub fn define(i: &str) -> IResult<&str, DefineStatement> {
 		map(login, DefineStatement::Login),
 		map(token, DefineStatement::Token),
 		map(scope, DefineStatement::Scope),
+		map(param, DefineStatement::Param),
 		map(table, DefineStatement::Table),
 		map(event, DefineStatement::Event),
 		map(field, DefineStatement::Field),
@@ -486,13 +492,13 @@ impl fmt::Display for DefineScopeStatement {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		write!(f, "DEFINE SCOPE {}", self.name)?;
 		if let Some(ref v) = self.session {
-			write!(f, " SESSION {}", v)?
+			write!(f, " SESSION {v}")?
 		}
 		if let Some(ref v) = self.signup {
-			write!(f, " SIGNUP {}", v)?
+			write!(f, " SIGNUP {v}")?
 		}
 		if let Some(ref v) = self.signin {
-			write!(f, " SIGNIN {}", v)?
+			write!(f, " SIGNIN {v}")?
 		}
 		Ok(())
 	}
@@ -563,6 +569,68 @@ fn scope_signin(i: &str) -> IResult<&str, DefineScopeOption> {
 	let (i, _) = shouldbespace(i)?;
 	let (i, v) = value(i)?;
 	Ok((i, DefineScopeOption::Signin(v)))
+}
+
+// --------------------------------------------------
+// --------------------------------------------------
+// --------------------------------------------------
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, Store, Hash)]
+pub struct DefineParamStatement {
+	pub name: Ident,
+	pub value: Value,
+}
+
+impl DefineParamStatement {
+	pub(crate) async fn compute(
+		&self,
+		_ctx: &Context<'_>,
+		opt: &Options,
+		txn: &Transaction,
+		_doc: Option<&Value>,
+	) -> Result<Value, Error> {
+		// Selected DB?
+		opt.needs(Level::Db)?;
+		// Allowed to run?
+		opt.check(Level::Db)?;
+		// Clone transaction
+		let run = txn.clone();
+		// Claim transaction
+		let mut run = run.lock().await;
+		// Process the statement
+		let key = crate::key::pa::new(opt.ns(), opt.db(), &self.name);
+		run.add_ns(opt.ns(), opt.strict).await?;
+		run.add_db(opt.ns(), opt.db(), opt.strict).await?;
+		run.set(key, self).await?;
+		// Ok all good
+		Ok(Value::None)
+	}
+}
+
+impl fmt::Display for DefineParamStatement {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		write!(f, "DEFINE PARAM ${} VALUE {}", self.name, self.value)
+	}
+}
+
+fn param(i: &str) -> IResult<&str, DefineParamStatement> {
+	let (i, _) = tag_no_case("DEFINE")(i)?;
+	let (i, _) = shouldbespace(i)?;
+	let (i, _) = tag_no_case("PARAM")(i)?;
+	let (i, _) = shouldbespace(i)?;
+	let (i, _) = char('$')(i)?;
+	let (i, name) = ident(i)?;
+	let (i, _) = shouldbespace(i)?;
+	let (i, _) = tag_no_case("VALUE")(i)?;
+	let (i, _) = shouldbespace(i)?;
+	let (i, value) = value(i)?;
+	Ok((
+		i,
+		DefineParamStatement {
+			name,
+			value,
+		},
+	))
 }
 
 // --------------------------------------------------
@@ -642,19 +710,24 @@ impl fmt::Display for DefineTableStatement {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		write!(f, "DEFINE TABLE {}", self.name)?;
 		if self.drop {
-			write!(f, " DROP")?
+			f.write_str(" DROP")?;
 		}
-		if self.full {
-			write!(f, " SCHEMAFULL")?
-		}
-		if !self.full {
-			write!(f, " SCHEMALESS")?
-		}
+		f.write_str(if self.full {
+			" SCHEMAFULL"
+		} else {
+			" SCHEMALESS"
+		})?;
 		if let Some(ref v) = self.view {
-			write!(f, " {}", v)?
+			write!(f, " {v}")?
 		}
 		if !self.permissions.is_full() {
-			write!(f, " {}", self.permissions)?;
+			let _indent = if is_pretty() {
+				Some(pretty_indent())
+			} else {
+				f.write_char(' ')?;
+				None
+			};
+			write!(f, "{}", self.permissions)?;
 		}
 		Ok(())
 	}
@@ -834,6 +907,7 @@ fn event(i: &str) -> IResult<&str, DefineEventStatement> {
 pub struct DefineFieldStatement {
 	pub name: Idiom,
 	pub what: Ident,
+	pub flex: bool,
 	pub kind: Option<Kind>,
 	pub value: Option<Value>,
 	pub assert: Option<Value>,
@@ -873,14 +947,17 @@ impl DefineFieldStatement {
 impl fmt::Display for DefineFieldStatement {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		write!(f, "DEFINE FIELD {} ON {}", self.name, self.what)?;
+		if self.flex {
+			write!(f, " FLEXIBLE")?
+		}
 		if let Some(ref v) = self.kind {
-			write!(f, " TYPE {}", v)?
+			write!(f, " TYPE {v}")?
 		}
 		if let Some(ref v) = self.value {
-			write!(f, " VALUE {}", v)?
+			write!(f, " VALUE {v}")?
 		}
 		if let Some(ref v) = self.assert {
-			write!(f, " ASSERT {}", v)?
+			write!(f, " ASSERT {v}")?
 		}
 		if !self.permissions.is_full() {
 			write!(f, " {}", self.permissions)?;
@@ -906,6 +983,13 @@ fn field(i: &str) -> IResult<&str, DefineFieldStatement> {
 		DefineFieldStatement {
 			name,
 			what,
+			flex: opts
+				.iter()
+				.find_map(|x| match x {
+					DefineFieldOption::Flex => Some(true),
+					_ => None,
+				})
+				.unwrap_or_default(),
 			kind: opts.iter().find_map(|x| match x {
 				DefineFieldOption::Kind(ref v) => Some(v.to_owned()),
 				_ => None,
@@ -931,6 +1015,7 @@ fn field(i: &str) -> IResult<&str, DefineFieldStatement> {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
 pub enum DefineFieldOption {
+	Flex,
 	Kind(Kind),
 	Value(Value),
 	Assert(Value),
@@ -938,7 +1023,13 @@ pub enum DefineFieldOption {
 }
 
 fn field_opts(i: &str) -> IResult<&str, DefineFieldOption> {
-	alt((field_kind, field_value, field_assert, field_permissions))(i)
+	alt((field_flex, field_kind, field_value, field_assert, field_permissions))(i)
+}
+
+fn field_flex(i: &str) -> IResult<&str, DefineFieldOption> {
+	let (i, _) = shouldbespace(i)?;
+	let (i, _) = alt((tag_no_case("FLEXIBLE"), tag_no_case("FLEXI"), tag_no_case("FLEX")))(i)?;
+	Ok((i, DefineFieldOption::Flex))
 }
 
 fn field_kind(i: &str) -> IResult<&str, DefineFieldOption> {

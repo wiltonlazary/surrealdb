@@ -20,7 +20,7 @@
 //! use surrealdb::{Result, Surreal};
 //! use surrealdb::sql;
 //! use surrealdb::opt::auth::Root;
-//! use surrealdb::engines::remote::ws::Ws;
+//! use surrealdb::engine::remote::ws::Ws;
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct Name {
@@ -81,11 +81,11 @@
 //!     let people: Vec<Person> = db.select("person").await?;
 //!
 //!     // Perform a custom advanced query
-//!     let sql = sql! {
+//!     let sql = r#"
 //!         SELECT marketing, count()
 //!         FROM type::table($table)
 //!         GROUP BY marketing
-//!     };
+//!     "#;
 //!
 //!     let groups = db.query(sql)
 //!         .bind(("table", "person"))
@@ -126,7 +126,7 @@ pub mod err;
 pub mod kvs;
 
 #[doc(inline)]
-pub use api::engines;
+pub use api::engine;
 #[doc(inline)]
 pub use api::method;
 #[doc(inline)]
@@ -160,9 +160,9 @@ pub mod error {
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
 	/// An error with an embedded storage engine
-	#[error("Database error: {0}")]
+	#[error("{0}")]
 	Db(#[from] crate::error::Db),
 	/// An error with a remote database instance
-	#[error("API error: {0}")]
+	#[error("{0}")]
 	Api(#[from] crate::error::Api),
 }
