@@ -3,12 +3,13 @@ use crate::dbs::Options;
 use crate::dbs::Transaction;
 use crate::err::Error;
 use crate::sql::comment::mightbespace;
+use crate::sql::ending::subquery as ending;
 use crate::sql::error::IResult;
-use crate::sql::paths::ID;
 use crate::sql::statements::create::{create, CreateStatement};
 use crate::sql::statements::delete::{delete, DeleteStatement};
 use crate::sql::statements::ifelse::{ifelse, IfelseStatement};
 use crate::sql::statements::insert::{insert, InsertStatement};
+use crate::sql::statements::output::{output, OutputStatement};
 use crate::sql::statements::relate::{relate, RelateStatement};
 use crate::sql::statements::select::{select, SelectStatement};
 use crate::sql::statements::update::{update, UpdateStatement};
@@ -24,6 +25,7 @@ use std::fmt::{self, Display, Formatter};
 pub enum Subquery {
 	Value(Value),
 	Ifelse(IfelseStatement),
+	Output(OutputStatement),
 	Select(SelectStatement),
 	Create(CreateStatement),
 	Update(UpdateStatement),
@@ -44,6 +46,7 @@ impl Subquery {
 		match self {
 			Self::Value(v) => v.writeable(),
 			Self::Ifelse(v) => v.writeable(),
+			Self::Output(v) => v.writeable(),
 			Self::Select(v) => v.writeable(),
 			Self::Create(v) => v.writeable(),
 			Self::Update(v) => v.writeable(),
@@ -66,28 +69,10 @@ impl Subquery {
 		match self {
 			Self::Value(ref v) => v.compute(ctx, opt, txn, doc).await,
 			Self::Ifelse(ref v) => v.compute(ctx, opt, txn, doc).await,
+			Self::Output(ref v) => v.compute(ctx, opt, txn, doc).await,
 			Self::Select(ref v) => {
-				// Duplicate context
-				let mut ctx = Context::new(ctx);
-				// Add parent document
-				if let Some(doc) = doc {
-					ctx.add_value("parent".into(), doc);
-				}
-				// Process subquery
-				let res = v.compute(&ctx, opt, txn, doc).await?;
-				// Process result
-				match v.limit(&ctx, opt, txn, doc).await? {
-					1 => match v.expr.single() {
-						Some(v) => res.first().get(&ctx, opt, txn, &v).await,
-						None => res.first().ok(),
-					},
-					_ => match v.expr.single() {
-						Some(v) => res.get(&ctx, opt, txn, &v).await,
-						None => res.ok(),
-					},
-				}
-			}
-			Self::Create(ref v) => {
+				// Is this a single output?
+				let one = v.single();
 				// Duplicate context
 				let mut ctx = Context::new(ctx);
 				// Add parent document
@@ -96,14 +81,42 @@ impl Subquery {
 				}
 				// Process subquery
 				match v.compute(&ctx, opt, txn, doc).await? {
-					Value::Array(mut v) => match v.len() {
-						1 => Ok(v.remove(0).pick(ID.as_ref())),
-						_ => Ok(Value::from(v).pick(ID.as_ref())),
+					// This is a single record result
+					Value::Array(mut a) if one => match a.len() {
+						// There was at least one result
+						v if v > 0 => Ok(a.remove(0)),
+						// There were no results
+						_ => Ok(Value::None),
 					},
+					// This is standard query result
+					v => Ok(v),
+				}
+			}
+			Self::Create(ref v) => {
+				// Is this a single output?
+				let one = v.single();
+				// Duplicate context
+				let mut ctx = Context::new(ctx);
+				// Add parent document
+				if let Some(doc) = doc {
+					ctx.add_value("parent".into(), doc);
+				}
+				// Process subquery
+				match v.compute(&ctx, opt, txn, doc).await? {
+					// This is a single record result
+					Value::Array(mut a) if one => match a.len() {
+						// There was at least one result
+						v if v > 0 => Ok(a.remove(0)),
+						// There were no results
+						_ => Ok(Value::None),
+					},
+					// This is standard query result
 					v => Ok(v),
 				}
 			}
 			Self::Update(ref v) => {
+				// Is this a single output?
+				let one = v.single();
 				// Duplicate context
 				let mut ctx = Context::new(ctx);
 				// Add parent document
@@ -112,14 +125,20 @@ impl Subquery {
 				}
 				// Process subquery
 				match v.compute(&ctx, opt, txn, doc).await? {
-					Value::Array(mut v) => match v.len() {
-						1 => Ok(v.remove(0).pick(ID.as_ref())),
-						_ => Ok(Value::from(v).pick(ID.as_ref())),
+					// This is a single record result
+					Value::Array(mut a) if one => match a.len() {
+						// There was at least one result
+						v if v > 0 => Ok(a.remove(0)),
+						// There were no results
+						_ => Ok(Value::None),
 					},
+					// This is standard query result
 					v => Ok(v),
 				}
 			}
 			Self::Delete(ref v) => {
+				// Is this a single output?
+				let one = v.single();
 				// Duplicate context
 				let mut ctx = Context::new(ctx);
 				// Add parent document
@@ -128,14 +147,20 @@ impl Subquery {
 				}
 				// Process subquery
 				match v.compute(&ctx, opt, txn, doc).await? {
-					Value::Array(mut v) => match v.len() {
-						1 => Ok(v.remove(0).pick(ID.as_ref())),
-						_ => Ok(Value::from(v).pick(ID.as_ref())),
+					// This is a single record result
+					Value::Array(mut a) if one => match a.len() {
+						// There was at least one result
+						v if v > 0 => Ok(a.remove(0)),
+						// There were no results
+						_ => Ok(Value::None),
 					},
+					// This is standard query result
 					v => Ok(v),
 				}
 			}
 			Self::Relate(ref v) => {
+				// Is this a single output?
+				let one = v.single();
 				// Duplicate context
 				let mut ctx = Context::new(ctx);
 				// Add parent document
@@ -144,14 +169,20 @@ impl Subquery {
 				}
 				// Process subquery
 				match v.compute(&ctx, opt, txn, doc).await? {
-					Value::Array(mut v) => match v.len() {
-						1 => Ok(v.remove(0).pick(ID.as_ref())),
-						_ => Ok(Value::from(v).pick(ID.as_ref())),
+					// This is a single record result
+					Value::Array(mut a) if one => match a.len() {
+						// There was at least one result
+						v if v > 0 => Ok(a.remove(0)),
+						// There were no results
+						_ => Ok(Value::None),
 					},
+					// This is standard query result
 					v => Ok(v),
 				}
 			}
 			Self::Insert(ref v) => {
+				// Is this a single output?
+				let one = v.single();
 				// Duplicate context
 				let mut ctx = Context::new(ctx);
 				// Add parent document
@@ -160,10 +191,14 @@ impl Subquery {
 				}
 				// Process subquery
 				match v.compute(&ctx, opt, txn, doc).await? {
-					Value::Array(mut v) => match v.len() {
-						1 => Ok(v.remove(0).pick(ID.as_ref())),
-						_ => Ok(Value::from(v).pick(ID.as_ref())),
+					// This is a single record result
+					Value::Array(mut a) if one => match a.len() {
+						// There was at least one result
+						v if v > 0 => Ok(a.remove(0)),
+						// There were no results
+						_ => Ok(Value::None),
 					},
+					// This is standard query result
 					v => Ok(v),
 				}
 			}
@@ -175,6 +210,7 @@ impl Display for Subquery {
 	fn fmt(&self, f: &mut Formatter) -> fmt::Result {
 		match self {
 			Self::Value(v) => write!(f, "({v})"),
+			Self::Output(v) => write!(f, "({v})"),
 			Self::Select(v) => write!(f, "({v})"),
 			Self::Create(v) => write!(f, "({v})"),
 			Self::Update(v) => write!(f, "({v})"),
@@ -187,7 +223,7 @@ impl Display for Subquery {
 }
 
 pub fn subquery(i: &str) -> IResult<&str, Subquery> {
-	alt((subquery_ifelse, subquery_others))(i)
+	alt((subquery_ifelse, subquery_other, subquery_value))(i)
 }
 
 fn subquery_ifelse(i: &str) -> IResult<&str, Subquery> {
@@ -195,21 +231,43 @@ fn subquery_ifelse(i: &str) -> IResult<&str, Subquery> {
 	Ok((i, v))
 }
 
-fn subquery_others(i: &str) -> IResult<&str, Subquery> {
+fn subquery_value(i: &str) -> IResult<&str, Subquery> {
 	let (i, _) = char('(')(i)?;
 	let (i, _) = mightbespace(i)?;
-	let (i, v) = alt((
+	let (i, v) = map(value, Subquery::Value)(i)?;
+	let (i, _) = mightbespace(i)?;
+	let (i, _) = char(')')(i)?;
+	Ok((i, v))
+}
+
+fn subquery_other(i: &str) -> IResult<&str, Subquery> {
+	alt((
+		|i| {
+			let (i, _) = char('(')(i)?;
+			let (i, _) = mightbespace(i)?;
+			let (i, v) = subquery_inner(i)?;
+			let (i, _) = mightbespace(i)?;
+			let (i, _) = char(')')(i)?;
+			Ok((i, v))
+		},
+		|i| {
+			let (i, v) = subquery_inner(i)?;
+			let (i, _) = ending(i)?;
+			Ok((i, v))
+		},
+	))(i)
+}
+
+fn subquery_inner(i: &str) -> IResult<&str, Subquery> {
+	alt((
+		map(output, Subquery::Output),
 		map(select, Subquery::Select),
 		map(create, Subquery::Create),
 		map(update, Subquery::Update),
 		map(delete, Subquery::Delete),
 		map(relate, Subquery::Relate),
 		map(insert, Subquery::Insert),
-		map(value, Subquery::Value),
-	))(i)?;
-	let (i, _) = mightbespace(i)?;
-	let (i, _) = char(')')(i)?;
-	Ok((i, v))
+	))(i)
 }
 
 #[cfg(test)]
