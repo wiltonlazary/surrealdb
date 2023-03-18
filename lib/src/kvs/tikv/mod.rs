@@ -32,41 +32,26 @@ impl Datastore {
 	}
 	/// Start a new transaction
 	pub async fn transaction(&self, write: bool, lock: bool) -> Result<Transaction, Error> {
-		match lock {
-			false => {
-				// Set the behaviour when dropping an unfinished transaction
-				let mut opt = TransactionOptions::new_optimistic().drop_check(CheckLevel::Warn);
-				// Set this transaction as read only if possible
-				if !write {
-					opt = opt.read_only();
-				}
-				// Create a new optimistic transaction
-				match self.db.begin_with_options(opt).await {
-					Ok(tx) => Ok(Transaction {
-						ok: false,
-						rw: write,
-						tx,
-					}),
-					Err(e) => Err(Error::Tx(e.to_string())),
-				}
-			}
-			true => {
-				// Set the behaviour when dropping an unfinished transaction
-				let mut opt = TransactionOptions::new_pessimistic().drop_check(CheckLevel::Warn);
-				// Set this transaction as read only if possible
-				if !write {
-					opt = opt.read_only();
-				}
-				// Create a new pessimistic transaction
-				match self.db.begin_with_options(opt).await {
-					Ok(tx) => Ok(Transaction {
-						ok: false,
-						rw: write,
-						tx,
-					}),
-					Err(e) => Err(Error::Tx(e.to_string())),
-				}
-			}
+		// Set whether this should be an optimistic or pessimistic transaction
+		let mut opt = if lock {
+			TransactionOptions::new_pessimistic()
+		} else {
+			TransactionOptions::new_optimistic()
+		};
+		// Set the behaviour when dropping an unfinished transaction
+		opt = opt.drop_check(CheckLevel::Warn);
+		// Set this transaction as read only if possible
+		if !write {
+			opt = opt.read_only();
+		}
+		// Create a new distributed transaction
+		match self.db.begin_with_options(opt).await {
+			Ok(tx) => Ok(Transaction {
+				ok: false,
+				rw: write,
+				tx,
+			}),
+			Err(e) => Err(Error::Tx(e.to_string())),
 		}
 	}
 }
@@ -265,5 +250,16 @@ impl Transaction {
 		let res = res.map(|kv| (Key::from(kv.0), kv.1)).collect();
 		// Return result
 		Ok(res)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use crate::kvs::tests::transaction::verify_transaction_isolation;
+	use test_log::test;
+
+	#[test(tokio::test(flavor = "multi_thread", worker_threads = 3))]
+	async fn tikv_transaction() {
+		verify_transaction_isolation("tikv://127.0.0.1:2379").await;
 	}
 }
