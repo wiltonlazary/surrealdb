@@ -6,6 +6,7 @@ use crate::dbs::Transaction;
 use crate::err::Error;
 use crate::sql::array::{array, Array};
 use crate::sql::block::{block, Block};
+use crate::sql::bytes::Bytes;
 use crate::sql::common::commas;
 use crate::sql::constant::{constant, Constant};
 use crate::sql::datetime::{datetime, Datetime};
@@ -14,11 +15,11 @@ use crate::sql::edges::{edges, Edges};
 use crate::sql::error::IResult;
 use crate::sql::expression::{expression, Expression};
 use crate::sql::fmt::{Fmt, Pretty};
-use crate::sql::function::{function, Function};
+use crate::sql::function::{self, function, Function};
 use crate::sql::future::{future, Future};
 use crate::sql::geometry::{geometry, Geometry};
 use crate::sql::id::Id;
-use crate::sql::idiom::{idiom, Idiom};
+use crate::sql::idiom::{self, Idiom};
 use crate::sql::kind::Kind;
 use crate::sql::model::{model, Model};
 use crate::sql::number::{number, Number};
@@ -56,6 +57,8 @@ use std::ops::Deref;
 use std::str::FromStr;
 
 static MATCHER: Lazy<SkimMatcherV2> = Lazy::new(|| SkimMatcherV2::default().ignore_case());
+
+pub(crate) const TOKEN: &str = "$surrealdb::private::sql::Value";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, Hash)]
 pub struct Values(pub Vec<Value>);
@@ -97,6 +100,7 @@ pub fn whats(i: &str) -> IResult<&str, Values> {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, PartialOrd, Deserialize, Store, Hash)]
+#[format(Named)]
 pub enum Value {
 	#[default]
 	None,
@@ -111,6 +115,7 @@ pub enum Value {
 	Array(Array),
 	Object(Object),
 	Geometry(Geometry),
+	Bytes(Bytes),
 	// ---
 	Param(Param),
 	Idiom(Idiom),
@@ -275,6 +280,12 @@ impl From<Subquery> for Value {
 impl From<Expression> for Value {
 	fn from(v: Expression) -> Self {
 		Value::Expression(Box::new(v))
+	}
+}
+
+impl From<Box<Edges>> for Value {
+	fn from(v: Box<Edges>) -> Self {
+		Value::Edges(v)
 	}
 }
 
@@ -762,7 +773,7 @@ impl Value {
 	/// Check if this Value is a Thing of a specific type
 	pub fn is_type_record(&self, types: &[Table]) -> bool {
 		match self {
-			Value::Thing(v) => types.iter().any(|tb| tb.0 == v.tb),
+			Value::Thing(v) => types.is_empty() || types.iter().any(|tb| tb.0 == v.tb),
 			_ => false,
 		}
 	}
@@ -803,7 +814,7 @@ impl Value {
 	pub fn as_int(self) -> i64 {
 		match self {
 			Value::True => 1,
-			Value::Strand(v) => v.parse::<i64>().unwrap_or(0),
+			Value::Strand(v) => Number::from(v.as_str()).as_int(),
 			Value::Number(v) => v.as_int(),
 			Value::Duration(v) => v.as_secs() as i64,
 			Value::Datetime(v) => v.timestamp(),
@@ -960,16 +971,12 @@ impl Value {
 	/// Converts this Value into a field name
 	pub fn to_idiom(&self) -> Idiom {
 		match self {
-			Value::Param(v) => v.simplify(),
 			Value::Idiom(v) => v.simplify(),
+			Value::Param(v) => v.to_raw().into(),
 			Value::Strand(v) => v.0.to_string().into(),
 			Value::Datetime(v) => v.0.to_string().into(),
-			Value::Future(_) => "fn::future".to_string().into(),
-			Value::Function(v) => match v.as_ref() {
-				Function::Script(_, _) => "fn::script".to_string().into(),
-				Function::Normal(f, _) => f.to_string().into(),
-				Function::Cast(_, v) => v.to_idiom(),
-			},
+			Value::Future(_) => "future".to_string().into(),
+			Value::Function(v) => v.to_idiom(),
 			_ => self.to_string().into(),
 		}
 	}
@@ -1070,6 +1077,10 @@ impl Value {
 			Kind::String => self.make_strand(),
 			Kind::Datetime => self.make_datetime(),
 			Kind::Duration => self.make_duration(),
+			Kind::Bytes => match self {
+				Value::Bytes(_) => self,
+				_ => Value::None,
+			},
 			Kind::Array => match self {
 				Value::Array(_) => self,
 				_ => Value::None,
@@ -1335,7 +1346,7 @@ impl Value {
 	/// Compare this Value to another Value lexicographically
 	pub fn lexical_cmp(&self, other: &Value) -> Option<Ordering> {
 		match (self, other) {
-			(Value::Strand(a), Value::Strand(b)) => Some(lexical_sort::lexical_cmp(a, b)),
+			(Value::Strand(a), Value::Strand(b)) => Some(lexicmp::lexical_cmp(a, b)),
 			_ => self.partial_cmp(other),
 		}
 	}
@@ -1343,7 +1354,7 @@ impl Value {
 	/// Compare this Value to another Value using natrual numerical comparison
 	pub fn natural_cmp(&self, other: &Value) -> Option<Ordering> {
 		match (self, other) {
-			(Value::Strand(a), Value::Strand(b)) => Some(lexical_sort::natural_cmp(a, b)),
+			(Value::Strand(a), Value::Strand(b)) => Some(lexicmp::natural_cmp(a, b)),
 			_ => self.partial_cmp(other),
 		}
 	}
@@ -1351,7 +1362,7 @@ impl Value {
 	/// Compare this Value to another Value lexicographically and using natrual numerical comparison
 	pub fn natural_lexical_cmp(&self, other: &Value) -> Option<Ordering> {
 		match (self, other) {
-			(Value::Strand(a), Value::Strand(b)) => Some(lexical_sort::natural_lexical_cmp(a, b)),
+			(Value::Strand(a), Value::Strand(b)) => Some(lexicmp::natural_lexical_cmp(a, b)),
 			_ => self.partial_cmp(other),
 		}
 	}
@@ -1395,6 +1406,7 @@ impl fmt::Display for Value {
 			Value::Function(v) => write!(f, "{v}"),
 			Value::Subquery(v) => write!(f, "{v}"),
 			Value::Expression(v) => write!(f, "{v}"),
+			Value::Bytes(_) => write!(f, "<bytes>"),
 		}
 	}
 }
@@ -1405,7 +1417,7 @@ impl Value {
 			Value::Block(v) => v.writeable(),
 			Value::Array(v) => v.iter().any(Value::writeable),
 			Value::Object(v) => v.iter().any(|(_, v)| v.writeable()),
-			Value::Function(v) => v.args().iter().any(Value::writeable),
+			Value::Function(v) => v.is_custom() || v.args().iter().any(Value::writeable),
 			Value::Subquery(v) => v.writeable(),
 			Value::Expression(v) => v.l.writeable() || v.r.writeable(),
 			_ => false,
@@ -1450,32 +1462,33 @@ impl Serialize for Value {
 	{
 		if is_internal_serialization() {
 			match self {
-				Value::None => s.serialize_unit_variant("Value", 0, "None"),
-				Value::Null => s.serialize_unit_variant("Value", 1, "Null"),
-				Value::False => s.serialize_unit_variant("Value", 2, "False"),
-				Value::True => s.serialize_unit_variant("Value", 3, "True"),
-				Value::Number(v) => s.serialize_newtype_variant("Value", 4, "Number", v),
-				Value::Strand(v) => s.serialize_newtype_variant("Value", 5, "Strand", v),
-				Value::Duration(v) => s.serialize_newtype_variant("Value", 6, "Duration", v),
-				Value::Datetime(v) => s.serialize_newtype_variant("Value", 7, "Datetime", v),
-				Value::Uuid(v) => s.serialize_newtype_variant("Value", 8, "Uuid", v),
-				Value::Array(v) => s.serialize_newtype_variant("Value", 9, "Array", v),
-				Value::Object(v) => s.serialize_newtype_variant("Value", 10, "Object", v),
-				Value::Geometry(v) => s.serialize_newtype_variant("Value", 11, "Geometry", v),
-				Value::Param(v) => s.serialize_newtype_variant("Value", 12, "Param", v),
-				Value::Idiom(v) => s.serialize_newtype_variant("Value", 13, "Idiom", v),
-				Value::Table(v) => s.serialize_newtype_variant("Value", 14, "Table", v),
-				Value::Thing(v) => s.serialize_newtype_variant("Value", 15, "Thing", v),
-				Value::Model(v) => s.serialize_newtype_variant("Value", 16, "Model", v),
-				Value::Regex(v) => s.serialize_newtype_variant("Value", 17, "Regex", v),
-				Value::Block(v) => s.serialize_newtype_variant("Value", 18, "Block", v),
-				Value::Range(v) => s.serialize_newtype_variant("Value", 19, "Range", v),
-				Value::Edges(v) => s.serialize_newtype_variant("Value", 20, "Edges", v),
-				Value::Future(v) => s.serialize_newtype_variant("Value", 21, "Future", v),
-				Value::Constant(v) => s.serialize_newtype_variant("Value", 22, "Constant", v),
-				Value::Function(v) => s.serialize_newtype_variant("Value", 23, "Function", v),
-				Value::Subquery(v) => s.serialize_newtype_variant("Value", 24, "Subquery", v),
-				Value::Expression(v) => s.serialize_newtype_variant("Value", 25, "Expression", v),
+				Value::None => s.serialize_unit_variant(TOKEN, 0, "None"),
+				Value::Null => s.serialize_unit_variant(TOKEN, 1, "Null"),
+				Value::False => s.serialize_unit_variant(TOKEN, 2, "False"),
+				Value::True => s.serialize_unit_variant(TOKEN, 3, "True"),
+				Value::Number(v) => s.serialize_newtype_variant(TOKEN, 4, "Number", v),
+				Value::Strand(v) => s.serialize_newtype_variant(TOKEN, 5, "Strand", v),
+				Value::Duration(v) => s.serialize_newtype_variant(TOKEN, 6, "Duration", v),
+				Value::Datetime(v) => s.serialize_newtype_variant(TOKEN, 7, "Datetime", v),
+				Value::Uuid(v) => s.serialize_newtype_variant(TOKEN, 8, "Uuid", v),
+				Value::Array(v) => s.serialize_newtype_variant(TOKEN, 9, "Array", v),
+				Value::Object(v) => s.serialize_newtype_variant(TOKEN, 10, "Object", v),
+				Value::Geometry(v) => s.serialize_newtype_variant(TOKEN, 11, "Geometry", v),
+				Value::Bytes(v) => s.serialize_newtype_variant(TOKEN, 12, "Bytes", v),
+				Value::Param(v) => s.serialize_newtype_variant(TOKEN, 13, "Param", v),
+				Value::Idiom(v) => s.serialize_newtype_variant(TOKEN, 14, "Idiom", v),
+				Value::Table(v) => s.serialize_newtype_variant(TOKEN, 15, "Table", v),
+				Value::Thing(v) => s.serialize_newtype_variant(TOKEN, 16, "Thing", v),
+				Value::Model(v) => s.serialize_newtype_variant(TOKEN, 17, "Model", v),
+				Value::Regex(v) => s.serialize_newtype_variant(TOKEN, 18, "Regex", v),
+				Value::Block(v) => s.serialize_newtype_variant(TOKEN, 19, "Block", v),
+				Value::Range(v) => s.serialize_newtype_variant(TOKEN, 20, "Range", v),
+				Value::Edges(v) => s.serialize_newtype_variant(TOKEN, 21, "Edges", v),
+				Value::Future(v) => s.serialize_newtype_variant(TOKEN, 22, "Future", v),
+				Value::Constant(v) => s.serialize_newtype_variant(TOKEN, 23, "Constant", v),
+				Value::Function(v) => s.serialize_newtype_variant(TOKEN, 24, "Function", v),
+				Value::Subquery(v) => s.serialize_newtype_variant(TOKEN, 25, "Subquery", v),
+				Value::Expression(v) => s.serialize_newtype_variant(TOKEN, 26, "Expression", v),
 			}
 		} else {
 			match self {
@@ -1547,14 +1560,12 @@ impl ops::Div for Value {
 	}
 }
 
+/// Parse any `Value` including binary expressions
 pub fn value(i: &str) -> IResult<&str, Value> {
-	alt((double, single))(i)
+	alt((map(expression, Value::from), single))(i)
 }
 
-pub fn double(i: &str) -> IResult<&str, Value> {
-	map(expression, Value::from)(i)
-}
-
+/// Parse any `Value` excluding binary expressions
 pub fn single(i: &str) -> IResult<&str, Value> {
 	alt((
 		alt((
@@ -1564,8 +1575,9 @@ pub fn single(i: &str) -> IResult<&str, Value> {
 			map(tag_no_case("false"), |_| Value::False),
 		)),
 		alt((
-			map(subquery, Value::from),
+			map(idiom::multi, Value::from),
 			map(function, Value::from),
+			map(subquery, Value::from),
 			map(constant, Value::from),
 			map(datetime, Value::from),
 			map(duration, Value::from),
@@ -1579,10 +1591,11 @@ pub fn single(i: &str) -> IResult<&str, Value> {
 			map(param, Value::from),
 			map(regex, Value::from),
 			map(model, Value::from),
-			map(idiom, Value::from),
+			map(edges, Value::from),
 			map(range, Value::from),
 			map(thing, Value::from),
 			map(strand, Value::from),
+			map(idiom::path, Value::from),
 		)),
 	))(i)
 }
@@ -1590,15 +1603,16 @@ pub fn single(i: &str) -> IResult<&str, Value> {
 pub fn select(i: &str) -> IResult<&str, Value> {
 	alt((
 		alt((
+			map(expression, Value::from),
 			map(tag_no_case("NONE"), |_| Value::None),
 			map(tag_no_case("NULL"), |_| Value::Null),
 			map(tag_no_case("true"), |_| Value::True),
 			map(tag_no_case("false"), |_| Value::False),
 		)),
 		alt((
-			map(expression, Value::from),
-			map(subquery, Value::from),
+			map(idiom::multi, Value::from),
 			map(function, Value::from),
+			map(subquery, Value::from),
 			map(constant, Value::from),
 			map(datetime, Value::from),
 			map(duration, Value::from),
@@ -1621,11 +1635,34 @@ pub fn select(i: &str) -> IResult<&str, Value> {
 	))(i)
 }
 
+/// Used as the starting part of a complex Idiom
+pub fn start(i: &str) -> IResult<&str, Value> {
+	alt((
+		map(function::normal, Value::from),
+		map(function::custom, Value::from),
+		map(subquery, Value::from),
+		map(constant, Value::from),
+		map(datetime, Value::from),
+		map(duration, Value::from),
+		map(unique, Value::from),
+		map(number, Value::from),
+		map(strand, Value::from),
+		map(object, Value::from),
+		map(array, Value::from),
+		map(param, Value::from),
+		map(edges, Value::from),
+		map(thing, Value::from),
+	))(i)
+}
+
+/// Used in CREATE, UPDATE, and DELETE clauses
 pub fn what(i: &str) -> IResult<&str, Value> {
 	alt((
-		map(subquery, Value::from),
 		map(function, Value::from),
+		map(subquery, Value::from),
 		map(constant, Value::from),
+		map(datetime, Value::from),
+		map(duration, Value::from),
 		map(future, Value::from),
 		map(block, Value::from),
 		map(param, Value::from),
@@ -1637,6 +1674,7 @@ pub fn what(i: &str) -> IResult<&str, Value> {
 	))(i)
 }
 
+/// Used to parse any simple JSON-like value
 pub fn json(i: &str) -> IResult<&str, Value> {
 	alt((
 		map(tag_no_case("NULL"), |_| Value::Null),
@@ -1822,6 +1860,17 @@ mod tests {
 		assert_eq!(8, std::mem::size_of::<Box<crate::sql::function::Function>>());
 		assert_eq!(8, std::mem::size_of::<Box<crate::sql::subquery::Subquery>>());
 		assert_eq!(8, std::mem::size_of::<Box<crate::sql::expression::Expression>>());
+	}
+
+	#[test]
+	fn check_serialize() {
+		assert_eq!(5, Value::None.to_vec().len());
+		assert_eq!(5, Value::Null.to_vec().len());
+		assert_eq!(5, Value::True.to_vec().len());
+		assert_eq!(6, Value::False.to_vec().len());
+		assert_eq!(13, Value::from("test").to_vec().len());
+		assert_eq!(29, Value::parse("{ hello: 'world' }").to_vec().len());
+		assert_eq!(43, Value::parse("{ compact: true, schema: 0 }").to_vec().len());
 	}
 
 	#[test]

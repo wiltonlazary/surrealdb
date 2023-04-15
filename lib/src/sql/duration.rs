@@ -21,6 +21,8 @@ static SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
 static SECONDS_PER_MINUTE: u64 = 60;
 static NANOSECONDS_PER_MILLISECOND: u32 = 1000000;
 
+pub(crate) const TOKEN: &str = "$surrealdb::private::sql::Duration";
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, PartialOrd, Deserialize, Hash)]
 pub struct Duration(pub time::Duration);
 
@@ -161,7 +163,7 @@ impl Serialize for Duration {
 		S: serde::Serializer,
 	{
 		if is_internal_serialization() {
-			serializer.serialize_newtype_struct("Duration", &self.0)
+			serializer.serialize_newtype_struct(TOKEN, &self.0)
 		} else {
 			serializer.serialize_some(&self.to_string())
 		}
@@ -171,28 +173,40 @@ impl Serialize for Duration {
 impl ops::Add for Duration {
 	type Output = Self;
 	fn add(self, other: Self) -> Self {
-		Duration::from(self.0 + other.0)
+		match self.0.checked_add(other.0) {
+			Some(v) => Duration::from(v),
+			None => Duration::from(time::Duration::MAX),
+		}
 	}
 }
 
 impl<'a, 'b> ops::Add<&'b Duration> for &'a Duration {
 	type Output = Duration;
 	fn add(self, other: &'b Duration) -> Duration {
-		Duration::from(self.0 + other.0)
+		match self.0.checked_add(other.0) {
+			Some(v) => Duration::from(v),
+			None => Duration::from(time::Duration::MAX),
+		}
 	}
 }
 
 impl ops::Sub for Duration {
 	type Output = Self;
 	fn sub(self, other: Self) -> Self {
-		Duration::from(self.0 - other.0)
+		match self.0.checked_sub(other.0) {
+			Some(v) => Duration::from(v),
+			None => Duration::default(),
+		}
 	}
 }
 
 impl<'a, 'b> ops::Sub<&'b Duration> for &'a Duration {
 	type Output = Duration;
 	fn sub(self, other: &'b Duration) -> Duration {
-		Duration::from(self.0 - other.0)
+		match self.0.checked_sub(other.0) {
+			Some(v) => Duration::from(v),
+			None => Duration::default(),
+		}
 	}
 }
 

@@ -13,7 +13,9 @@ use crate::sql::Query;
 use crate::sql::Value;
 use channel::Sender;
 use futures::lock::Mutex;
+use std::fmt;
 use std::sync::Arc;
+use tracing::instrument;
 
 /// The underlying datastore instance which stores the dataset.
 #[allow(dead_code)]
@@ -33,6 +35,26 @@ pub(super) enum Inner {
 	TiKV(super::tikv::Datastore),
 	#[cfg(feature = "kv-fdb")]
 	FDB(super::fdb::Datastore),
+}
+
+impl fmt::Display for Datastore {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		#![allow(unused_variables)]
+		match &self.inner {
+			#[cfg(feature = "kv-mem")]
+			Inner::Mem(_) => write!(f, "memory"),
+			#[cfg(feature = "kv-rocksdb")]
+			Inner::RocksDB(_) => write!(f, "rocksdb"),
+			#[cfg(feature = "kv-indxdb")]
+			Inner::IndxDB(_) => write!(f, "indexdb"),
+			#[cfg(feature = "kv-tikv")]
+			Inner::TiKV(_) => write!(f, "tikv"),
+			#[cfg(feature = "kv-fdb")]
+			Inner::FDB(_) => write!(f, "fdb"),
+			#[allow(unreachable_patterns)]
+			_ => unreachable!(),
+		}
+	}
 }
 
 impl Datastore {
@@ -168,50 +190,40 @@ impl Datastore {
 	/// ```
 	pub async fn transaction(&self, write: bool, lock: bool) -> Result<Transaction, Error> {
 		#![allow(unused_variables)]
-		match &self.inner {
+		let inner = match &self.inner {
 			#[cfg(feature = "kv-mem")]
 			Inner::Mem(v) => {
 				let tx = v.transaction(write, lock).await?;
-				Ok(Transaction {
-					inner: super::tx::Inner::Mem(tx),
-					cache: super::cache::Cache::default(),
-				})
+				super::tx::Inner::Mem(tx)
 			}
 			#[cfg(feature = "kv-rocksdb")]
 			Inner::RocksDB(v) => {
 				let tx = v.transaction(write, lock).await?;
-				Ok(Transaction {
-					inner: super::tx::Inner::RocksDB(tx),
-					cache: super::cache::Cache::default(),
-				})
+				super::tx::Inner::RocksDB(tx)
 			}
 			#[cfg(feature = "kv-indxdb")]
 			Inner::IndxDB(v) => {
 				let tx = v.transaction(write, lock).await?;
-				Ok(Transaction {
-					inner: super::tx::Inner::IndxDB(tx),
-					cache: super::cache::Cache::default(),
-				})
+				super::tx::Inner::IndxDB(tx)
 			}
 			#[cfg(feature = "kv-tikv")]
 			Inner::TiKV(v) => {
 				let tx = v.transaction(write, lock).await?;
-				Ok(Transaction {
-					inner: super::tx::Inner::TiKV(tx),
-					cache: super::cache::Cache::default(),
-				})
+				super::tx::Inner::TiKV(tx)
 			}
 			#[cfg(feature = "kv-fdb")]
 			Inner::FDB(v) => {
 				let tx = v.transaction(write, lock).await?;
-				Ok(Transaction {
-					inner: super::tx::Inner::FDB(tx),
-					cache: super::cache::Cache::default(),
-				})
+				super::tx::Inner::FDB(tx)
 			}
 			#[allow(unreachable_patterns)]
 			_ => unreachable!(),
-		}
+		};
+
+		Ok(Transaction {
+			inner,
+			cache: super::cache::Cache::default(),
+		})
 	}
 
 	/// Parse and execute an SQL query
@@ -230,6 +242,7 @@ impl Datastore {
 	///     Ok(())
 	/// }
 	/// ```
+	#[instrument(skip_all)]
 	pub async fn execute(
 		&self,
 		txt: &str,
@@ -279,6 +292,7 @@ impl Datastore {
 	///     Ok(())
 	/// }
 	/// ```
+	#[instrument(skip_all)]
 	pub async fn process(
 		&self,
 		ast: Query,
@@ -327,6 +341,7 @@ impl Datastore {
 	///     Ok(())
 	/// }
 	/// ```
+	#[instrument(skip_all)]
 	pub async fn compute(
 		&self,
 		val: Value,
@@ -365,6 +380,7 @@ impl Datastore {
 	}
 
 	/// Performs a full database export as SQL
+	#[instrument(skip(self, chn))]
 	pub async fn export(&self, ns: String, db: String, chn: Sender<Vec<u8>>) -> Result<(), Error> {
 		// Start a new transaction
 		let mut txn = self.transaction(false, false).await?;

@@ -17,6 +17,7 @@ use sql::permission::Permissions;
 use sql::statements::DefineDatabaseStatement;
 use sql::statements::DefineEventStatement;
 use sql::statements::DefineFieldStatement;
+use sql::statements::DefineFunctionStatement;
 use sql::statements::DefineIndexStatement;
 use sql::statements::DefineLoginStatement;
 use sql::statements::DefineNamespaceStatement;
@@ -25,10 +26,12 @@ use sql::statements::DefineScopeStatement;
 use sql::statements::DefineTableStatement;
 use sql::statements::DefineTokenStatement;
 use sql::statements::LiveStatement;
+use std::fmt;
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
 
+#[cfg(debug_assertions)]
 const LOG: &str = "surrealdb::txn";
 
 /// A set of undoable updates and requests against a dataset.
@@ -52,7 +55,31 @@ pub(super) enum Inner {
 	FDB(super::fdb::Transaction),
 }
 
+impl fmt::Display for Transaction {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		#![allow(unused_variables)]
+		match &self.inner {
+			#[cfg(feature = "kv-mem")]
+			Inner::Mem(_) => write!(f, "memory"),
+			#[cfg(feature = "kv-rocksdb")]
+			Inner::RocksDB(_) => write!(f, "rocksdb"),
+			#[cfg(feature = "kv-indxdb")]
+			Inner::IndxDB(_) => write!(f, "indexdb"),
+			#[cfg(feature = "kv-tikv")]
+			Inner::TiKV(_) => write!(f, "tikv"),
+			#[cfg(feature = "kv-fdb")]
+			Inner::FDB(_) => write!(f, "fdb"),
+			#[allow(unreachable_patterns)]
+			_ => unreachable!(),
+		}
+	}
+}
+
 impl Transaction {
+	// --------------------------------------------------
+	// Integral methods
+	// --------------------------------------------------
+
 	/// Check if transactions is finished.
 	///
 	/// If the transaction has been cancelled or committed,
@@ -92,6 +119,7 @@ impl Transaction {
 			_ => unreachable!(),
 		}
 	}
+
 	/// Cancel a transaction.
 	///
 	/// This reverses all changes made within the transaction.
@@ -128,6 +156,7 @@ impl Transaction {
 			_ => unreachable!(),
 		}
 	}
+
 	/// Commit a transaction.
 	///
 	/// This attempts to commit all changes made within the transaction.
@@ -164,6 +193,7 @@ impl Transaction {
 			_ => unreachable!(),
 		}
 	}
+
 	/// Delete a key from the datastore.
 	#[allow(unused_variables)]
 	pub async fn del<K>(&mut self, key: K) -> Result<(), Error>
@@ -202,6 +232,7 @@ impl Transaction {
 			_ => unreachable!(),
 		}
 	}
+
 	/// Check if a key exists in the datastore.
 	#[allow(unused_variables)]
 	pub async fn exi<K>(&mut self, key: K) -> Result<bool, Error>
@@ -240,6 +271,7 @@ impl Transaction {
 			_ => unreachable!(),
 		}
 	}
+
 	/// Fetch a key from the datastore.
 	#[allow(unused_variables)]
 	pub async fn get<K>(&mut self, key: K) -> Result<Option<Val>, Error>
@@ -278,6 +310,7 @@ impl Transaction {
 			_ => unreachable!(),
 		}
 	}
+
 	/// Insert or update a key in the datastore.
 	#[allow(unused_variables)]
 	pub async fn set<K, V>(&mut self, key: K, val: V) -> Result<(), Error>
@@ -317,6 +350,7 @@ impl Transaction {
 			_ => unreachable!(),
 		}
 	}
+
 	/// Insert a key if it doesn't exist in the datastore.
 	#[allow(unused_variables)]
 	pub async fn put<K, V>(&mut self, key: K, val: V) -> Result<(), Error>
@@ -356,6 +390,7 @@ impl Transaction {
 			_ => unreachable!(),
 		}
 	}
+
 	/// Retrieve a specific range of keys from the datastore.
 	///
 	/// This function fetches the full range of key-value pairs, in a single request to the underlying datastore.
@@ -396,6 +431,7 @@ impl Transaction {
 			_ => unreachable!(),
 		}
 	}
+
 	/// Update a key in the datastore if the current value matches a condition.
 	#[allow(unused_variables)]
 	pub async fn putc<K, V>(&mut self, key: K, val: V, chk: Option<V>) -> Result<(), Error>
@@ -435,6 +471,7 @@ impl Transaction {
 			_ => unreachable!(),
 		}
 	}
+
 	/// Delete a key from the datastore if the current value matches a condition.
 	#[allow(unused_variables)]
 	pub async fn delc<K, V>(&mut self, key: K, chk: Option<V>) -> Result<(), Error>
@@ -474,6 +511,11 @@ impl Transaction {
 			_ => unreachable!(),
 		}
 	}
+
+	// --------------------------------------------------
+	// Superjacent methods
+	// --------------------------------------------------
+
 	/// Retrieve a specific range of keys from the datastore.
 	///
 	/// This function fetches key-value pairs from the underlying datastore in batches of 1000.
@@ -672,6 +714,11 @@ impl Transaction {
 		}
 		Ok(())
 	}
+
+	// --------------------------------------------------
+	// Superimposed methods
+	// --------------------------------------------------
+
 	/// Clear any cache entry for the specified key.
 	pub async fn clr<K>(&mut self, key: K) -> Result<(), Error>
 	where
@@ -681,78 +728,83 @@ impl Transaction {
 		self.cache.del(&key);
 		Ok(())
 	}
+
 	/// Retrieve all namespace definitions in a datastore.
 	pub async fn all_ns(&mut self) -> Result<Arc<[DefineNamespaceStatement]>, Error> {
 		let key = crate::key::ns::prefix();
-		match self.cache.exi(&key) {
-			true => match self.cache.get(&key) {
-				Some(Entry::Nss(v)) => Ok(v),
-				_ => unreachable!(),
-			},
-			_ => {
-				let beg = crate::key::ns::prefix();
-				let end = crate::key::ns::suffix();
-				let val = self.getr(beg..end, u32::MAX).await?;
-				let val = val.convert().into();
-				self.cache.set(key, Entry::Nss(Arc::clone(&val)));
-				Ok(val)
+		Ok(if let Some(e) = self.cache.get(&key) {
+			if let Entry::Nss(v) = e {
+				v
+			} else {
+				unreachable!();
 			}
-		}
+		} else {
+			let beg = crate::key::ns::prefix();
+			let end = crate::key::ns::suffix();
+			let val = self.getr(beg..end, u32::MAX).await?;
+			let val = val.convert().into();
+			self.cache.set(key, Entry::Nss(Arc::clone(&val)));
+			val
+		})
 	}
+
 	/// Retrieve all namespace login definitions for a specific namespace.
 	pub async fn all_nl(&mut self, ns: &str) -> Result<Arc<[DefineLoginStatement]>, Error> {
 		let key = crate::key::nl::prefix(ns);
-		match self.cache.exi(&key) {
-			true => match self.cache.get(&key) {
-				Some(Entry::Nls(v)) => Ok(v),
-				_ => unreachable!(),
-			},
-			_ => {
-				let beg = crate::key::nl::prefix(ns);
-				let end = crate::key::nl::suffix(ns);
-				let val = self.getr(beg..end, u32::MAX).await?;
-				let val = val.convert().into();
-				self.cache.set(key, Entry::Nls(Arc::clone(&val)));
-				Ok(val)
+		Ok(if let Some(e) = self.cache.get(&key) {
+			if let Entry::Nls(v) = e {
+				v
+			} else {
+				unreachable!();
 			}
-		}
+		} else {
+			let beg = crate::key::nl::prefix(ns);
+			let end = crate::key::nl::suffix(ns);
+			let val = self.getr(beg..end, u32::MAX).await?;
+			let val = val.convert().into();
+			self.cache.set(key, Entry::Nls(Arc::clone(&val)));
+			val
+		})
 	}
+
 	/// Retrieve all namespace token definitions for a specific namespace.
 	pub async fn all_nt(&mut self, ns: &str) -> Result<Arc<[DefineTokenStatement]>, Error> {
 		let key = crate::key::nt::prefix(ns);
-		match self.cache.exi(&key) {
-			true => match self.cache.get(&key) {
-				Some(Entry::Nts(v)) => Ok(v),
-				_ => unreachable!(),
-			},
-			_ => {
-				let beg = crate::key::nt::prefix(ns);
-				let end = crate::key::nt::suffix(ns);
-				let val = self.getr(beg..end, u32::MAX).await?;
-				let val = val.convert().into();
-				self.cache.set(key, Entry::Nts(Arc::clone(&val)));
-				Ok(val)
+		Ok(if let Some(e) = self.cache.get(&key) {
+			if let Entry::Nts(v) = e {
+				v
+			} else {
+				unreachable!();
 			}
-		}
+		} else {
+			let beg = crate::key::nt::prefix(ns);
+			let end = crate::key::nt::suffix(ns);
+			let val = self.getr(beg..end, u32::MAX).await?;
+			let val = val.convert().into();
+			self.cache.set(key, Entry::Nts(Arc::clone(&val)));
+			val
+		})
 	}
+
 	/// Retrieve all database definitions for a specific namespace.
 	pub async fn all_db(&mut self, ns: &str) -> Result<Arc<[DefineDatabaseStatement]>, Error> {
 		let key = crate::key::db::prefix(ns);
-		match self.cache.exi(&key) {
-			true => match self.cache.get(&key) {
-				Some(Entry::Dbs(v)) => Ok(v),
-				_ => unreachable!(),
-			},
-			_ => {
-				let beg = crate::key::db::prefix(ns);
-				let end = crate::key::db::suffix(ns);
-				let val = self.getr(beg..end, u32::MAX).await?;
-				let val = val.convert().into();
-				self.cache.set(key, Entry::Dbs(Arc::clone(&val)));
-				Ok(val)
+		Ok(if let Some(e) = self.cache.get(&key) {
+			if let Entry::Dbs(v) = e {
+				v
+			} else {
+				unreachable!();
 			}
-		}
+		} else {
+			let beg = crate::key::db::prefix(ns);
+			let end = crate::key::db::suffix(ns);
+			let val = self.getr(beg..end, u32::MAX).await?;
+			let val = val.convert().into();
+			self.cache.set(key, Entry::Dbs(Arc::clone(&val)));
+			val
+		})
 	}
+
 	/// Retrieve all database login definitions for a specific database.
 	pub async fn all_dl(
 		&mut self,
@@ -760,21 +812,22 @@ impl Transaction {
 		db: &str,
 	) -> Result<Arc<[DefineLoginStatement]>, Error> {
 		let key = crate::key::dl::prefix(ns, db);
-		match self.cache.exi(&key) {
-			true => match self.cache.get(&key) {
-				Some(Entry::Dls(v)) => Ok(v),
-				_ => unreachable!(),
-			},
-			_ => {
-				let beg = crate::key::dl::prefix(ns, db);
-				let end = crate::key::dl::suffix(ns, db);
-				let val = self.getr(beg..end, u32::MAX).await?;
-				let val = val.convert().into();
-				self.cache.set(key, Entry::Dls(Arc::clone(&val)));
-				Ok(val)
+		Ok(if let Some(e) = self.cache.get(&key) {
+			if let Entry::Dls(v) = e {
+				v
+			} else {
+				unreachable!();
 			}
-		}
+		} else {
+			let beg = crate::key::dl::prefix(ns, db);
+			let end = crate::key::dl::suffix(ns, db);
+			let val = self.getr(beg..end, u32::MAX).await?;
+			let val = val.convert().into();
+			self.cache.set(key, Entry::Dls(Arc::clone(&val)));
+			val
+		})
 	}
+
 	/// Retrieve all database token definitions for a specific database.
 	pub async fn all_dt(
 		&mut self,
@@ -782,21 +835,45 @@ impl Transaction {
 		db: &str,
 	) -> Result<Arc<[DefineTokenStatement]>, Error> {
 		let key = crate::key::dt::prefix(ns, db);
-		match self.cache.exi(&key) {
-			true => match self.cache.get(&key) {
-				Some(Entry::Dts(v)) => Ok(v),
-				_ => unreachable!(),
-			},
-			_ => {
-				let beg = crate::key::dt::prefix(ns, db);
-				let end = crate::key::dt::suffix(ns, db);
-				let val = self.getr(beg..end, u32::MAX).await?;
-				let val = val.convert().into();
-				self.cache.set(key, Entry::Dts(Arc::clone(&val)));
-				Ok(val)
+		Ok(if let Some(e) = self.cache.get(&key) {
+			if let Entry::Dts(v) = e {
+				v
+			} else {
+				unreachable!();
 			}
-		}
+		} else {
+			let beg = crate::key::dt::prefix(ns, db);
+			let end = crate::key::dt::suffix(ns, db);
+			let val = self.getr(beg..end, u32::MAX).await?;
+			let val = val.convert().into();
+			self.cache.set(key, Entry::Dts(Arc::clone(&val)));
+			val
+		})
 	}
+
+	/// Retrieve all function definitions for a specific database.
+	pub async fn all_fc(
+		&mut self,
+		ns: &str,
+		db: &str,
+	) -> Result<Arc<[DefineFunctionStatement]>, Error> {
+		let key = crate::key::fc::prefix(ns, db);
+		Ok(if let Some(e) = self.cache.get(&key) {
+			if let Entry::Fcs(v) = e {
+				v
+			} else {
+				unreachable!();
+			}
+		} else {
+			let beg = crate::key::fc::prefix(ns, db);
+			let end = crate::key::fc::suffix(ns, db);
+			let val = self.getr(beg..end, u32::MAX).await?;
+			let val = val.convert().into();
+			self.cache.set(key, Entry::Fcs(Arc::clone(&val)));
+			val
+		})
+	}
+
 	/// Retrieve all scope definitions for a specific database.
 	pub async fn all_sc(
 		&mut self,
@@ -804,21 +881,22 @@ impl Transaction {
 		db: &str,
 	) -> Result<Arc<[DefineScopeStatement]>, Error> {
 		let key = crate::key::sc::prefix(ns, db);
-		match self.cache.exi(&key) {
-			true => match self.cache.get(&key) {
-				Some(Entry::Scs(v)) => Ok(v),
-				_ => unreachable!(),
-			},
-			_ => {
-				let beg = crate::key::sc::prefix(ns, db);
-				let end = crate::key::sc::suffix(ns, db);
-				let val = self.getr(beg..end, u32::MAX).await?;
-				let val = val.convert().into();
-				self.cache.set(key, Entry::Scs(Arc::clone(&val)));
-				Ok(val)
+		Ok(if let Some(e) = self.cache.get(&key) {
+			if let Entry::Scs(v) = e {
+				v
+			} else {
+				unreachable!();
 			}
-		}
+		} else {
+			let beg = crate::key::sc::prefix(ns, db);
+			let end = crate::key::sc::suffix(ns, db);
+			let val = self.getr(beg..end, u32::MAX).await?;
+			let val = val.convert().into();
+			self.cache.set(key, Entry::Scs(Arc::clone(&val)));
+			val
+		})
 	}
+
 	/// Retrieve all scope token definitions for a scope.
 	pub async fn all_st(
 		&mut self,
@@ -827,21 +905,22 @@ impl Transaction {
 		sc: &str,
 	) -> Result<Arc<[DefineTokenStatement]>, Error> {
 		let key = crate::key::st::prefix(ns, db, sc);
-		match self.cache.exi(&key) {
-			true => match self.cache.get(&key) {
-				Some(Entry::Sts(v)) => Ok(v),
-				_ => unreachable!(),
-			},
-			_ => {
-				let beg = crate::key::st::prefix(ns, db, sc);
-				let end = crate::key::st::suffix(ns, db, sc);
-				let val = self.getr(beg..end, u32::MAX).await?;
-				let val = val.convert().into();
-				self.cache.set(key, Entry::Sts(Arc::clone(&val)));
-				Ok(val)
+		Ok(if let Some(e) = self.cache.get(&key) {
+			if let Entry::Sts(v) = e {
+				v
+			} else {
+				unreachable!();
 			}
-		}
+		} else {
+			let beg = crate::key::st::prefix(ns, db, sc);
+			let end = crate::key::st::suffix(ns, db, sc);
+			let val = self.getr(beg..end, u32::MAX).await?;
+			let val = val.convert().into();
+			self.cache.set(key, Entry::Sts(Arc::clone(&val)));
+			val
+		})
 	}
+
 	/// Retrieve all scope definitions for a specific database.
 	pub async fn all_pa(
 		&mut self,
@@ -849,21 +928,22 @@ impl Transaction {
 		db: &str,
 	) -> Result<Arc<[DefineParamStatement]>, Error> {
 		let key = crate::key::pa::prefix(ns, db);
-		match self.cache.exi(&key) {
-			true => match self.cache.get(&key) {
-				Some(Entry::Pas(v)) => Ok(v),
-				_ => unreachable!(),
-			},
-			_ => {
-				let beg = crate::key::pa::prefix(ns, db);
-				let end = crate::key::pa::suffix(ns, db);
-				let val = self.getr(beg..end, u32::MAX).await?;
-				let val = val.convert().into();
-				self.cache.set(key, Entry::Pas(Arc::clone(&val)));
-				Ok(val)
+		Ok(if let Some(e) = self.cache.get(&key) {
+			if let Entry::Pas(v) = e {
+				v
+			} else {
+				unreachable!();
 			}
-		}
+		} else {
+			let beg = crate::key::pa::prefix(ns, db);
+			let end = crate::key::pa::suffix(ns, db);
+			let val = self.getr(beg..end, u32::MAX).await?;
+			let val = val.convert().into();
+			self.cache.set(key, Entry::Pas(Arc::clone(&val)));
+			val
+		})
 	}
+
 	/// Retrieve all table definitions for a specific database.
 	pub async fn all_tb(
 		&mut self,
@@ -871,21 +951,22 @@ impl Transaction {
 		db: &str,
 	) -> Result<Arc<[DefineTableStatement]>, Error> {
 		let key = crate::key::tb::prefix(ns, db);
-		match self.cache.exi(&key) {
-			true => match self.cache.get(&key) {
-				Some(Entry::Tbs(v)) => Ok(v),
-				_ => unreachable!(),
-			},
-			_ => {
-				let beg = crate::key::tb::prefix(ns, db);
-				let end = crate::key::tb::suffix(ns, db);
-				let val = self.getr(beg..end, u32::MAX).await?;
-				let val = val.convert().into();
-				self.cache.set(key, Entry::Tbs(Arc::clone(&val)));
-				Ok(val)
+		Ok(if let Some(e) = self.cache.get(&key) {
+			if let Entry::Tbs(v) = e {
+				v
+			} else {
+				unreachable!();
 			}
-		}
+		} else {
+			let beg = crate::key::tb::prefix(ns, db);
+			let end = crate::key::tb::suffix(ns, db);
+			let val = self.getr(beg..end, u32::MAX).await?;
+			let val = val.convert().into();
+			self.cache.set(key, Entry::Tbs(Arc::clone(&val)));
+			val
+		})
 	}
+
 	/// Retrieve all event definitions for a specific table.
 	pub async fn all_ev(
 		&mut self,
@@ -894,21 +975,22 @@ impl Transaction {
 		tb: &str,
 	) -> Result<Arc<[DefineEventStatement]>, Error> {
 		let key = crate::key::ev::prefix(ns, db, tb);
-		match self.cache.exi(&key) {
-			true => match self.cache.get(&key) {
-				Some(Entry::Evs(v)) => Ok(v),
-				_ => unreachable!(),
-			},
-			_ => {
-				let beg = crate::key::ev::prefix(ns, db, tb);
-				let end = crate::key::ev::suffix(ns, db, tb);
-				let val = self.getr(beg..end, u32::MAX).await?;
-				let val = val.convert().into();
-				self.cache.set(key, Entry::Evs(Arc::clone(&val)));
-				Ok(val)
+		Ok(if let Some(e) = self.cache.get(&key) {
+			if let Entry::Evs(v) = e {
+				v
+			} else {
+				unreachable!();
 			}
-		}
+		} else {
+			let beg = crate::key::ev::prefix(ns, db, tb);
+			let end = crate::key::ev::suffix(ns, db, tb);
+			let val = self.getr(beg..end, u32::MAX).await?;
+			let val = val.convert().into();
+			self.cache.set(key, Entry::Evs(Arc::clone(&val)));
+			val
+		})
 	}
+
 	/// Retrieve all field definitions for a specific table.
 	pub async fn all_fd(
 		&mut self,
@@ -917,21 +999,22 @@ impl Transaction {
 		tb: &str,
 	) -> Result<Arc<[DefineFieldStatement]>, Error> {
 		let key = crate::key::fd::prefix(ns, db, tb);
-		match self.cache.exi(&key) {
-			true => match self.cache.get(&key) {
-				Some(Entry::Fds(v)) => Ok(v),
-				_ => unreachable!(),
-			},
-			_ => {
-				let beg = crate::key::fd::prefix(ns, db, tb);
-				let end = crate::key::fd::suffix(ns, db, tb);
-				let val = self.getr(beg..end, u32::MAX).await?;
-				let val = val.convert().into();
-				self.cache.set(key, Entry::Fds(Arc::clone(&val)));
-				Ok(val)
+		Ok(if let Some(e) = self.cache.get(&key) {
+			if let Entry::Fds(v) = e {
+				v
+			} else {
+				unreachable!();
 			}
-		}
+		} else {
+			let beg = crate::key::fd::prefix(ns, db, tb);
+			let end = crate::key::fd::suffix(ns, db, tb);
+			let val = self.getr(beg..end, u32::MAX).await?;
+			let val = val.convert().into();
+			self.cache.set(key, Entry::Fds(Arc::clone(&val)));
+			val
+		})
 	}
+
 	/// Retrieve all index definitions for a specific table.
 	pub async fn all_ix(
 		&mut self,
@@ -940,21 +1023,22 @@ impl Transaction {
 		tb: &str,
 	) -> Result<Arc<[DefineIndexStatement]>, Error> {
 		let key = crate::key::ix::prefix(ns, db, tb);
-		match self.cache.exi(&key) {
-			true => match self.cache.get(&key) {
-				Some(Entry::Ixs(v)) => Ok(v),
-				_ => unreachable!(),
-			},
-			_ => {
-				let beg = crate::key::ix::prefix(ns, db, tb);
-				let end = crate::key::ix::suffix(ns, db, tb);
-				let val = self.getr(beg..end, u32::MAX).await?;
-				let val = val.convert().into();
-				self.cache.set(key, Entry::Ixs(Arc::clone(&val)));
-				Ok(val)
+		Ok(if let Some(e) = self.cache.get(&key) {
+			if let Entry::Ixs(v) = e {
+				v
+			} else {
+				unreachable!();
 			}
-		}
+		} else {
+			let beg = crate::key::ix::prefix(ns, db, tb);
+			let end = crate::key::ix::suffix(ns, db, tb);
+			let val = self.getr(beg..end, u32::MAX).await?;
+			let val = val.convert().into();
+			self.cache.set(key, Entry::Ixs(Arc::clone(&val)));
+			val
+		})
 	}
+
 	/// Retrieve all view definitions for a specific table.
 	pub async fn all_ft(
 		&mut self,
@@ -963,21 +1047,22 @@ impl Transaction {
 		tb: &str,
 	) -> Result<Arc<[DefineTableStatement]>, Error> {
 		let key = crate::key::ft::prefix(ns, db, tb);
-		match self.cache.exi(&key) {
-			true => match self.cache.get(&key) {
-				Some(Entry::Fts(v)) => Ok(v),
-				_ => unreachable!(),
-			},
-			_ => {
-				let beg = crate::key::ft::prefix(ns, db, tb);
-				let end = crate::key::ft::suffix(ns, db, tb);
-				let val = self.getr(beg..end, u32::MAX).await?;
-				let val = val.convert().into();
-				self.cache.set(key, Entry::Fts(Arc::clone(&val)));
-				Ok(val)
+		Ok(if let Some(e) = self.cache.get(&key) {
+			if let Entry::Fts(v) = e {
+				v
+			} else {
+				unreachable!();
 			}
-		}
+		} else {
+			let beg = crate::key::ft::prefix(ns, db, tb);
+			let end = crate::key::ft::suffix(ns, db, tb);
+			let val = self.getr(beg..end, u32::MAX).await?;
+			let val = val.convert().into();
+			self.cache.set(key, Entry::Fts(Arc::clone(&val)));
+			val
+		})
 	}
+
 	/// Retrieve all live definitions for a specific table.
 	pub async fn all_lv(
 		&mut self,
@@ -986,45 +1071,58 @@ impl Transaction {
 		tb: &str,
 	) -> Result<Arc<[LiveStatement]>, Error> {
 		let key = crate::key::lv::prefix(ns, db, tb);
-		match self.cache.exi(&key) {
-			true => match self.cache.get(&key) {
-				Some(Entry::Lvs(v)) => Ok(v),
-				_ => unreachable!(),
-			},
-			_ => {
-				let beg = crate::key::lv::prefix(ns, db, tb);
-				let end = crate::key::lv::suffix(ns, db, tb);
-				let val = self.getr(beg..end, u32::MAX).await?;
-				let val = val.convert().into();
-				self.cache.set(key, Entry::Lvs(Arc::clone(&val)));
-				Ok(val)
+		Ok(if let Some(e) = self.cache.get(&key) {
+			if let Entry::Lvs(v) = e {
+				v
+			} else {
+				unreachable!();
 			}
-		}
+		} else {
+			let beg = crate::key::lv::prefix(ns, db, tb);
+			let end = crate::key::lv::suffix(ns, db, tb);
+			let val = self.getr(beg..end, u32::MAX).await?;
+			let val = val.convert().into();
+			self.cache.set(key, Entry::Lvs(Arc::clone(&val)));
+			val
+		})
 	}
+
 	/// Retrieve a specific namespace definition.
 	pub async fn get_ns(&mut self, ns: &str) -> Result<DefineNamespaceStatement, Error> {
 		let key = crate::key::ns::new(ns);
-		let val = self.get(key).await?.ok_or(Error::NsNotFound)?;
+		let val = self.get(key).await?.ok_or(Error::NsNotFound {
+			value: ns.to_owned(),
+		})?;
 		Ok(val.into())
 	}
+
 	/// Retrieve a specific namespace login definition.
 	pub async fn get_nl(&mut self, ns: &str, nl: &str) -> Result<DefineLoginStatement, Error> {
 		let key = crate::key::nl::new(ns, nl);
-		let val = self.get(key).await?.ok_or(Error::NlNotFound)?;
+		let val = self.get(key).await?.ok_or(Error::NlNotFound {
+			value: nl.to_owned(),
+		})?;
 		Ok(val.into())
 	}
+
 	/// Retrieve a specific namespace token definition.
 	pub async fn get_nt(&mut self, ns: &str, nt: &str) -> Result<DefineTokenStatement, Error> {
 		let key = crate::key::nt::new(ns, nt);
-		let val = self.get(key).await?.ok_or(Error::NtNotFound)?;
+		let val = self.get(key).await?.ok_or(Error::NtNotFound {
+			value: nt.to_owned(),
+		})?;
 		Ok(val.into())
 	}
+
 	/// Retrieve a specific database definition.
 	pub async fn get_db(&mut self, ns: &str, db: &str) -> Result<DefineDatabaseStatement, Error> {
 		let key = crate::key::db::new(ns, db);
-		let val = self.get(key).await?.ok_or(Error::DbNotFound)?;
+		let val = self.get(key).await?.ok_or(Error::DbNotFound {
+			value: db.to_owned(),
+		})?;
 		Ok(val.into())
 	}
+
 	/// Retrieve a specific database login definition.
 	pub async fn get_dl(
 		&mut self,
@@ -1033,9 +1131,12 @@ impl Transaction {
 		dl: &str,
 	) -> Result<DefineLoginStatement, Error> {
 		let key = crate::key::dl::new(ns, db, dl);
-		let val = self.get(key).await?.ok_or(Error::DlNotFound)?;
+		let val = self.get(key).await?.ok_or(Error::DlNotFound {
+			value: dl.to_owned(),
+		})?;
 		Ok(val.into())
 	}
+
 	/// Retrieve a specific database token definition.
 	pub async fn get_dt(
 		&mut self,
@@ -1044,9 +1145,12 @@ impl Transaction {
 		dt: &str,
 	) -> Result<DefineTokenStatement, Error> {
 		let key = crate::key::dt::new(ns, db, dt);
-		let val = self.get(key).await?.ok_or(Error::DtNotFound)?;
+		let val = self.get(key).await?.ok_or(Error::DtNotFound {
+			value: dt.to_owned(),
+		})?;
 		Ok(val.into())
 	}
+
 	/// Retrieve a specific scope definition.
 	pub async fn get_sc(
 		&mut self,
@@ -1055,9 +1159,12 @@ impl Transaction {
 		sc: &str,
 	) -> Result<DefineScopeStatement, Error> {
 		let key = crate::key::sc::new(ns, db, sc);
-		let val = self.get(key).await?.ok_or(Error::ScNotFound)?;
+		let val = self.get(key).await?.ok_or(Error::ScNotFound {
+			value: sc.to_owned(),
+		})?;
 		Ok(val.into())
 	}
+
 	/// Retrieve a specific scope token definition.
 	pub async fn get_st(
 		&mut self,
@@ -1067,9 +1174,26 @@ impl Transaction {
 		st: &str,
 	) -> Result<DefineTokenStatement, Error> {
 		let key = crate::key::st::new(ns, db, sc, st);
-		let val = self.get(key).await?.ok_or(Error::StNotFound)?;
+		let val = self.get(key).await?.ok_or(Error::StNotFound {
+			value: st.to_owned(),
+		})?;
 		Ok(val.into())
 	}
+
+	/// Retrieve a specific function definition.
+	pub async fn get_fc(
+		&mut self,
+		ns: &str,
+		db: &str,
+		fc: &str,
+	) -> Result<DefineFunctionStatement, Error> {
+		let key = crate::key::fc::new(ns, db, fc);
+		let val = self.get(key).await?.ok_or(Error::FcNotFound {
+			value: fc.to_owned(),
+		})?;
+		Ok(val.into())
+	}
+
 	/// Retrieve a specific param definition.
 	pub async fn get_pa(
 		&mut self,
@@ -1078,9 +1202,12 @@ impl Transaction {
 		pa: &str,
 	) -> Result<DefineParamStatement, Error> {
 		let key = crate::key::pa::new(ns, db, pa);
-		let val = self.get(key).await?.ok_or(Error::PaNotFound)?;
+		let val = self.get(key).await?.ok_or(Error::PaNotFound {
+			value: pa.to_owned(),
+		})?;
 		Ok(val.into())
 	}
+
 	/// Retrieve a specific table definition.
 	pub async fn get_tb(
 		&mut self,
@@ -1089,9 +1216,12 @@ impl Transaction {
 		tb: &str,
 	) -> Result<DefineTableStatement, Error> {
 		let key = crate::key::tb::new(ns, db, tb);
-		let val = self.get(key).await?.ok_or(Error::TbNotFound)?;
+		let val = self.get(key).await?.ok_or(Error::TbNotFound {
+			value: tb.to_owned(),
+		})?;
 		Ok(val.into())
 	}
+
 	/// Add a namespace with a default configuration, only if we are in dynamic mode.
 	pub async fn add_ns(
 		&mut self,
@@ -1099,7 +1229,9 @@ impl Transaction {
 		strict: bool,
 	) -> Result<DefineNamespaceStatement, Error> {
 		match self.get_ns(ns).await {
-			Err(Error::NsNotFound) => match strict {
+			Err(Error::NsNotFound {
+				value,
+			}) => match strict {
 				false => {
 					let key = crate::key::ns::new(ns);
 					let val = DefineNamespaceStatement {
@@ -1108,12 +1240,15 @@ impl Transaction {
 					self.put(key, &val).await?;
 					Ok(val)
 				}
-				true => Err(Error::NsNotFound),
+				true => Err(Error::NsNotFound {
+					value,
+				}),
 			},
 			Err(e) => Err(e),
 			Ok(v) => Ok(v),
 		}
 	}
+
 	/// Add a database with a default configuration, only if we are in dynamic mode.
 	pub async fn add_db(
 		&mut self,
@@ -1122,7 +1257,9 @@ impl Transaction {
 		strict: bool,
 	) -> Result<DefineDatabaseStatement, Error> {
 		match self.get_db(ns, db).await {
-			Err(Error::DbNotFound) => match strict {
+			Err(Error::DbNotFound {
+				value,
+			}) => match strict {
 				false => {
 					let key = crate::key::db::new(ns, db);
 					let val = DefineDatabaseStatement {
@@ -1131,12 +1268,15 @@ impl Transaction {
 					self.put(key, &val).await?;
 					Ok(val)
 				}
-				true => Err(Error::DbNotFound),
+				true => Err(Error::DbNotFound {
+					value,
+				}),
 			},
 			Err(e) => Err(e),
 			Ok(v) => Ok(v),
 		}
 	}
+
 	/// Add a scope with a default configuration, only if we are in dynamic mode.
 	pub async fn add_sc(
 		&mut self,
@@ -1146,7 +1286,9 @@ impl Transaction {
 		strict: bool,
 	) -> Result<DefineScopeStatement, Error> {
 		match self.get_sc(ns, db, sc).await {
-			Err(Error::ScNotFound) => match strict {
+			Err(Error::ScNotFound {
+				value,
+			}) => match strict {
 				false => {
 					let key = crate::key::sc::new(ns, db, sc);
 					let val = DefineScopeStatement {
@@ -1156,12 +1298,15 @@ impl Transaction {
 					self.put(key, &val).await?;
 					Ok(val)
 				}
-				true => Err(Error::ScNotFound),
+				true => Err(Error::ScNotFound {
+					value,
+				}),
 			},
 			Err(e) => Err(e),
 			Ok(v) => Ok(v),
 		}
 	}
+
 	/// Add a table with a default configuration, only if we are in dynamic mode.
 	pub async fn add_tb(
 		&mut self,
@@ -1171,7 +1316,9 @@ impl Transaction {
 		strict: bool,
 	) -> Result<DefineTableStatement, Error> {
 		match self.get_tb(ns, db, tb).await {
-			Err(Error::TbNotFound) => match strict {
+			Err(Error::TbNotFound {
+				value,
+			}) => match strict {
 				false => {
 					let key = crate::key::tb::new(ns, db, tb);
 					let val = DefineTableStatement {
@@ -1182,31 +1329,37 @@ impl Transaction {
 					self.put(key, &val).await?;
 					Ok(val)
 				}
-				true => Err(Error::TbNotFound),
+				true => Err(Error::TbNotFound {
+					value,
+				}),
 			},
 			Err(e) => Err(e),
 			Ok(v) => Ok(v),
 		}
 	}
+
 	/// Retrieve and cache a specific namespace definition.
 	pub async fn get_and_cache_ns(
 		&mut self,
 		ns: &str,
 	) -> Result<Arc<DefineNamespaceStatement>, Error> {
 		let key = crate::key::ns::new(ns).encode()?;
-		match self.cache.exi(&key) {
-			true => match self.cache.get(&key) {
-				Some(Entry::Ns(v)) => Ok(v),
-				_ => unreachable!(),
-			},
-			_ => {
-				let val = self.get(key.clone()).await?.ok_or(Error::NsNotFound)?;
-				let val: Arc<DefineNamespaceStatement> = Arc::new(val.into());
-				self.cache.set(key, Entry::Ns(Arc::clone(&val)));
-				Ok(val)
+		Ok(if let Some(e) = self.cache.get(&key) {
+			if let Entry::Ns(v) = e {
+				v
+			} else {
+				unreachable!();
 			}
-		}
+		} else {
+			let val = self.get(key.clone()).await?.ok_or(Error::NsNotFound {
+				value: ns.to_owned(),
+			})?;
+			let val: Arc<DefineNamespaceStatement> = Arc::new(val.into());
+			self.cache.set(key, Entry::Ns(Arc::clone(&val)));
+			val
+		})
 	}
+
 	/// Retrieve and cache a specific database definition.
 	pub async fn get_and_cache_db(
 		&mut self,
@@ -1214,19 +1367,22 @@ impl Transaction {
 		db: &str,
 	) -> Result<Arc<DefineDatabaseStatement>, Error> {
 		let key = crate::key::db::new(ns, db).encode()?;
-		match self.cache.exi(&key) {
-			true => match self.cache.get(&key) {
-				Some(Entry::Db(v)) => Ok(v),
-				_ => unreachable!(),
-			},
-			_ => {
-				let val = self.get(key.clone()).await?.ok_or(Error::DbNotFound)?;
-				let val: Arc<DefineDatabaseStatement> = Arc::new(val.into());
-				self.cache.set(key, Entry::Db(Arc::clone(&val)));
-				Ok(val)
+		Ok(if let Some(e) = self.cache.get(&key) {
+			if let Entry::Db(v) = e {
+				v
+			} else {
+				unreachable!();
 			}
-		}
+		} else {
+			let val = self.get(key.clone()).await?.ok_or(Error::DbNotFound {
+				value: db.to_owned(),
+			})?;
+			let val: Arc<DefineDatabaseStatement> = Arc::new(val.into());
+			self.cache.set(key, Entry::Db(Arc::clone(&val)));
+			val
+		})
 	}
+
 	/// Retrieve and cache a specific table definition.
 	pub async fn get_and_cache_tb(
 		&mut self,
@@ -1235,19 +1391,22 @@ impl Transaction {
 		tb: &str,
 	) -> Result<Arc<DefineTableStatement>, Error> {
 		let key = crate::key::tb::new(ns, db, tb).encode()?;
-		match self.cache.exi(&key) {
-			true => match self.cache.get(&key) {
-				Some(Entry::Tb(v)) => Ok(v),
-				_ => unreachable!(),
-			},
-			_ => {
-				let val = self.get(key.clone()).await?.ok_or(Error::TbNotFound)?;
-				let val: Arc<DefineTableStatement> = Arc::new(val.into());
-				self.cache.set(key, Entry::Tb(Arc::clone(&val)));
-				Ok(val)
+		Ok(if let Some(e) = self.cache.get(&key) {
+			if let Entry::Tb(v) = e {
+				v
+			} else {
+				unreachable!();
 			}
-		}
+		} else {
+			let val = self.get(key.clone()).await?.ok_or(Error::TbNotFound {
+				value: tb.to_owned(),
+			})?;
+			let val: Arc<DefineTableStatement> = Arc::new(val.into());
+			self.cache.set(key, Entry::Tb(Arc::clone(&val)));
+			val
+		})
 	}
+
 	/// Add a namespace with a default configuration, only if we are in dynamic mode.
 	pub async fn add_and_cache_ns(
 		&mut self,
@@ -1255,7 +1414,9 @@ impl Transaction {
 		strict: bool,
 	) -> Result<Arc<DefineNamespaceStatement>, Error> {
 		match self.get_and_cache_ns(ns).await {
-			Err(Error::NsNotFound) => match strict {
+			Err(Error::NsNotFound {
+				value,
+			}) => match strict {
 				false => {
 					let key = crate::key::ns::new(ns);
 					let val = DefineNamespaceStatement {
@@ -1264,12 +1425,15 @@ impl Transaction {
 					self.put(key, &val).await?;
 					Ok(Arc::new(val))
 				}
-				true => Err(Error::NsNotFound),
+				true => Err(Error::NsNotFound {
+					value,
+				}),
 			},
 			Err(e) => Err(e),
 			Ok(v) => Ok(v),
 		}
 	}
+
 	/// Add a database with a default configuration, only if we are in dynamic mode.
 	pub async fn add_and_cache_db(
 		&mut self,
@@ -1278,7 +1442,9 @@ impl Transaction {
 		strict: bool,
 	) -> Result<Arc<DefineDatabaseStatement>, Error> {
 		match self.get_and_cache_db(ns, db).await {
-			Err(Error::DbNotFound) => match strict {
+			Err(Error::DbNotFound {
+				value,
+			}) => match strict {
 				false => {
 					let key = crate::key::db::new(ns, db);
 					let val = DefineDatabaseStatement {
@@ -1287,12 +1453,15 @@ impl Transaction {
 					self.put(key, &val).await?;
 					Ok(Arc::new(val))
 				}
-				true => Err(Error::DbNotFound),
+				true => Err(Error::DbNotFound {
+					value,
+				}),
 			},
 			Err(e) => Err(e),
 			Ok(v) => Ok(v),
 		}
 	}
+
 	/// Add a table with a default configuration, only if we are in dynamic mode.
 	pub async fn add_and_cache_tb(
 		&mut self,
@@ -1302,7 +1471,9 @@ impl Transaction {
 		strict: bool,
 	) -> Result<Arc<DefineTableStatement>, Error> {
 		match self.get_and_cache_tb(ns, db, tb).await {
-			Err(Error::TbNotFound) => match strict {
+			Err(Error::TbNotFound {
+				value,
+			}) => match strict {
 				false => {
 					let key = crate::key::tb::new(ns, db, tb);
 					let val = DefineTableStatement {
@@ -1313,12 +1484,15 @@ impl Transaction {
 					self.put(key, &val).await?;
 					Ok(Arc::new(val))
 				}
-				true => Err(Error::TbNotFound),
+				true => Err(Error::TbNotFound {
+					value,
+				}),
 			},
 			Err(e) => Err(e),
 			Ok(v) => Ok(v),
 		}
 	}
+
 	/// Retrieve and cache a specific table definition.
 	pub async fn check_ns_db_tb(
 		&mut self,
@@ -1339,6 +1513,11 @@ impl Transaction {
 			}
 		}
 	}
+
+	// --------------------------------------------------
+	// Additional methods
+	// --------------------------------------------------
+
 	/// Writes the full database contents as binary SQL.
 	pub async fn export(&mut self, ns: &str, db: &str, chn: Sender<Vec<u8>>) -> Result<(), Error> {
 		// Output OPTIONS
@@ -1349,6 +1528,20 @@ impl Transaction {
 			chn.send(bytes!("")).await?;
 			chn.send(bytes!("OPTION IMPORT;")).await?;
 			chn.send(bytes!("")).await?;
+		}
+		// Output FUNCTIONS
+		{
+			let fcs = self.all_fc(ns, db).await?;
+			if !fcs.is_empty() {
+				chn.send(bytes!("-- ------------------------------")).await?;
+				chn.send(bytes!("-- FUNCTIONS")).await?;
+				chn.send(bytes!("-- ------------------------------")).await?;
+				chn.send(bytes!("")).await?;
+				for fc in fcs.iter() {
+					chn.send(bytes!(format!("{fc};"))).await?;
+				}
+				chn.send(bytes!("")).await?;
+			}
 		}
 		// Output LOGINS
 		{
@@ -1378,20 +1571,6 @@ impl Transaction {
 				chn.send(bytes!("")).await?;
 			}
 		}
-		// Output SCOPES
-		{
-			let scs = self.all_sc(ns, db).await?;
-			if !scs.is_empty() {
-				chn.send(bytes!("-- ------------------------------")).await?;
-				chn.send(bytes!("-- SCOPES")).await?;
-				chn.send(bytes!("-- ------------------------------")).await?;
-				chn.send(bytes!("")).await?;
-				for sc in scs.iter() {
-					chn.send(bytes!(format!("{sc};"))).await?;
-				}
-				chn.send(bytes!("")).await?;
-			}
-		}
 		// Output PARAMS
 		{
 			let pas = self.all_pa(ns, db).await?;
@@ -1402,6 +1581,31 @@ impl Transaction {
 				chn.send(bytes!("")).await?;
 				for pa in pas.iter() {
 					chn.send(bytes!(format!("{pa};"))).await?;
+				}
+				chn.send(bytes!("")).await?;
+			}
+		}
+		// Output SCOPES
+		{
+			let scs = self.all_sc(ns, db).await?;
+			if !scs.is_empty() {
+				chn.send(bytes!("-- ------------------------------")).await?;
+				chn.send(bytes!("-- SCOPES")).await?;
+				chn.send(bytes!("-- ------------------------------")).await?;
+				chn.send(bytes!("")).await?;
+				for sc in scs.iter() {
+					// Output SCOPE
+					chn.send(bytes!(format!("{sc};"))).await?;
+					// Output TOKENS
+					{
+						let sts = self.all_st(ns, db, &sc.name).await?;
+						if !sts.is_empty() {
+							for st in sts.iter() {
+								chn.send(bytes!(format!("{st};"))).await?;
+							}
+							chn.send(bytes!("")).await?;
+						}
+					}
 				}
 				chn.send(bytes!("")).await?;
 			}
