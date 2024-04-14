@@ -7,21 +7,23 @@ use crate::api::conn::Router;
 use crate::api::engine;
 use crate::api::engine::any::Any;
 use crate::api::err::Error;
-use crate::api::opt::Endpoint;
+use crate::api::opt::{Endpoint, EndpointKind};
 use crate::api::DbResponse;
-#[allow(unused_imports)] // used by the `ws` and `http` protocols
 use crate::api::ExtraFeatures;
+use crate::api::OnceLockExt;
 use crate::api::Result;
 use crate::api::Surreal;
 use crate::error::Db as DbError;
+use crate::opt::WaitFor;
 use flume::Receiver;
-use once_cell::sync::OnceCell;
 use std::collections::HashSet;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use tokio::sync::watch;
 
 impl crate::api::Connection for Any {}
 
@@ -47,14 +49,13 @@ impl Connection for Any {
 			let (conn_tx, conn_rx) = flume::bounded::<Result<()>>(1);
 			let mut features = HashSet::new();
 
-			match address.endpoint.scheme() {
-				"fdb" => {
+			match EndpointKind::from(address.url.scheme()) {
+				EndpointKind::FoundationDb => {
 					#[cfg(feature = "kv-fdb")]
 					{
+						features.insert(ExtraFeatures::LiveQueries);
 						engine::local::wasm::router(address, conn_tx, route_rx);
-						if let Err(error) = conn_rx.into_recv_async().await? {
-							return Err(error);
-						}
+						conn_rx.into_recv_async().await??;
 					}
 
 					#[cfg(not(feature = "kv-fdb"))]
@@ -63,13 +64,12 @@ impl Connection for Any {
 					);
 				}
 
-				"indxdb" => {
+				EndpointKind::IndxDb => {
 					#[cfg(feature = "kv-indxdb")]
 					{
+						features.insert(ExtraFeatures::LiveQueries);
 						engine::local::wasm::router(address, conn_tx, route_rx);
-						if let Err(error) = conn_rx.into_recv_async().await? {
-							return Err(error);
-						}
+						conn_rx.into_recv_async().await??;
 					}
 
 					#[cfg(not(feature = "kv-indxdb"))]
@@ -78,13 +78,12 @@ impl Connection for Any {
 					);
 				}
 
-				"mem" => {
+				EndpointKind::Memory => {
 					#[cfg(feature = "kv-mem")]
 					{
+						features.insert(ExtraFeatures::LiveQueries);
 						engine::local::wasm::router(address, conn_tx, route_rx);
-						if let Err(error) = conn_rx.into_recv_async().await? {
-							return Err(error);
-						}
+						conn_rx.into_recv_async().await??;
 					}
 
 					#[cfg(not(feature = "kv-mem"))]
@@ -93,13 +92,12 @@ impl Connection for Any {
 					);
 				}
 
-				"file" | "rocksdb" => {
+				EndpointKind::File | EndpointKind::RocksDb => {
 					#[cfg(feature = "kv-rocksdb")]
 					{
+						features.insert(ExtraFeatures::LiveQueries);
 						engine::local::wasm::router(address, conn_tx, route_rx);
-						if let Err(error) = conn_rx.into_recv_async().await? {
-							return Err(error);
-						}
+						conn_rx.into_recv_async().await??;
 					}
 
 					#[cfg(not(feature = "kv-rocksdb"))]
@@ -109,13 +107,42 @@ impl Connection for Any {
 					.into());
 				}
 
-				"tikv" => {
+				EndpointKind::SpeeDb => {
+					#[cfg(feature = "kv-speedb")]
+					{
+						features.insert(ExtraFeatures::LiveQueries);
+						engine::local::wasm::router(address, conn_tx, route_rx);
+						conn_rx.into_recv_async().await??;
+					}
+
+					#[cfg(not(feature = "kv-speedb"))]
+					return Err(DbError::Ds(
+						"Cannot connect to the `speedb` storage engine as it is not enabled in this build of SurrealDB".to_owned(),
+					)
+					.into());
+				}
+
+				EndpointKind::SurrealKV => {
+					#[cfg(feature = "kv-surrealkv")]
+					{
+						features.insert(ExtraFeatures::LiveQueries);
+						engine::local::wasm::router(address, conn_tx, route_rx);
+						conn_rx.into_recv_async().await??;
+					}
+
+					#[cfg(not(feature = "kv-surrealkv"))]
+					return Err(DbError::Ds(
+						"Cannot connect to the `surrealkv` storage engine as it is not enabled in this build of SurrealDB".to_owned(),
+					)
+					.into());
+				}
+
+				EndpointKind::TiKv => {
 					#[cfg(feature = "kv-tikv")]
 					{
+						features.insert(ExtraFeatures::LiveQueries);
 						engine::local::wasm::router(address, conn_tx, route_rx);
-						if let Err(error) = conn_rx.into_recv_async().await? {
-							return Err(error);
-						}
+						conn_rx.into_recv_async().await??;
 					}
 
 					#[cfg(not(feature = "kv-tikv"))]
@@ -124,10 +151,9 @@ impl Connection for Any {
 					);
 				}
 
-				"http" | "https" => {
+				EndpointKind::Http | EndpointKind::Https => {
 					#[cfg(feature = "protocol-http")]
 					{
-						features.insert(ExtraFeatures::Auth);
 						engine::remote::http::wasm::router(address, conn_tx, route_rx);
 					}
 
@@ -138,16 +164,14 @@ impl Connection for Any {
 					.into());
 				}
 
-				"ws" | "wss" => {
+				EndpointKind::Ws | EndpointKind::Wss => {
 					#[cfg(feature = "protocol-ws")]
 					{
-						features.insert(ExtraFeatures::Auth);
-						let mut address = address;
-						address.endpoint = address.endpoint.join(engine::remote::ws::PATH)?;
-						engine::remote::ws::wasm::router(address, capacity, conn_tx, route_rx);
-						if let Err(error) = conn_rx.into_recv_async().await? {
-							return Err(error);
-						}
+						features.insert(ExtraFeatures::LiveQueries);
+						let mut endpoint = address;
+						endpoint.url = endpoint.url.join(engine::remote::ws::PATH)?;
+						engine::remote::ws::wasm::router(endpoint, capacity, conn_tx, route_rx);
+						conn_rx.into_recv_async().await??;
 					}
 
 					#[cfg(not(feature = "protocol-ws"))]
@@ -157,25 +181,24 @@ impl Connection for Any {
 					.into());
 				}
 
-				scheme => {
-					return Err(Error::Scheme(scheme.to_owned()).into());
-				}
+				EndpointKind::Unsupported(v) => return Err(Error::Scheme(v).into()),
 			}
 
 			Ok(Surreal {
-				router: OnceCell::with_value(Arc::new(Router {
+				router: Arc::new(OnceLock::with_value(Router {
 					features,
-					conn: PhantomData,
 					sender: route_tx,
 					last_id: AtomicI64::new(0),
 				})),
+				waiter: Arc::new(watch::channel(Some(WaitFor::Connection))),
+				engine: PhantomData,
 			})
 		})
 	}
 
 	fn send<'r>(
 		&'r mut self,
-		router: &'r Router<Self>,
+		router: &'r Router,
 		param: Param,
 	) -> Pin<Box<dyn Future<Output = Result<Receiver<Result<DbResponse>>>> + Send + Sync + 'r>> {
 		Box::pin(async move {

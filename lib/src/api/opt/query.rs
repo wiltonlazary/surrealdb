@@ -1,14 +1,13 @@
-use crate::api::err::Error;
-use crate::api::opt::from_value;
-use crate::api::Response as QueryResponse;
-use crate::api::Result;
-use crate::sql;
-use crate::sql::statements::*;
-use crate::sql::Object;
-use crate::sql::Statement;
-use crate::sql::Statements;
-use crate::sql::Value;
+use crate::api::{err::Error, Response as QueryResponse, Result};
+use crate::method;
+use crate::method::{Stats, Stream};
+use crate::sql::from_value;
+use crate::sql::{self, statements::*, Statement, Statements, Value};
+use crate::{syn, Notification};
+use futures::future::Either;
+use futures::stream::select_all;
 use serde::de::DeserializeOwned;
+use std::marker::PhantomData;
 use std::mem;
 
 /// A trait for converting inputs into SQL statements
@@ -19,15 +18,13 @@ pub trait IntoQuery {
 
 impl IntoQuery for sql::Query {
 	fn into_query(self) -> Result<Vec<Statement>> {
-		let sql::Query(Statements(statements)) = self;
-		Ok(statements)
+		Ok(self.0 .0)
 	}
 }
 
 impl IntoQuery for Statements {
 	fn into_query(self) -> Result<Vec<Statement>> {
-		let Statements(statements) = self;
-		Ok(statements)
+		Ok(self.0)
 	}
 }
 
@@ -159,19 +156,19 @@ impl IntoQuery for OptionStatement {
 
 impl IntoQuery for &str {
 	fn into_query(self) -> Result<Vec<Statement>> {
-		sql::parse(self)?.into_query()
+		syn::parse(self)?.into_query()
 	}
 }
 
 impl IntoQuery for &String {
 	fn into_query(self) -> Result<Vec<Statement>> {
-		sql::parse(self)?.into_query()
+		syn::parse(self)?.into_query()
 	}
 }
 
 impl IntoQuery for String {
 	fn into_query(self) -> Result<Vec<Statement>> {
-		sql::parse(&self)?.into_query()
+		syn::parse(&self)?.into_query()
 	}
 }
 
@@ -182,14 +179,23 @@ where
 {
 	/// Extracts and deserializes a query result from a query response
 	fn query_result(self, response: &mut QueryResponse) -> Result<Response>;
+
+	/// Extracts the statistics from a query response
+	fn stats(&self, response: &QueryResponse) -> Option<Stats> {
+		response.results.get(&0).map(|x| x.0)
+	}
 }
 
 impl QueryResult<Value> for usize {
-	fn query_result(self, QueryResponse(map): &mut QueryResponse) -> Result<Value> {
-		match map.remove(&self) {
-			Some(result) => Ok(result?.into()),
+	fn query_result(self, response: &mut QueryResponse) -> Result<Value> {
+		match response.results.swap_remove(&self) {
+			Some((_, result)) => Ok(result?),
 			None => Ok(Value::None),
 		}
+	}
+
+	fn stats(&self, response: &QueryResponse) -> Option<Stats> {
+		response.results.get(self).map(|x| x.0)
 	}
 }
 
@@ -197,13 +203,13 @@ impl<T> QueryResult<Option<T>> for usize
 where
 	T: DeserializeOwned,
 {
-	fn query_result(self, QueryResponse(map): &mut QueryResponse) -> Result<Option<T>> {
-		let vec = match map.get_mut(&self) {
-			Some(result) => match result {
-				Ok(vec) => vec,
+	fn query_result(self, response: &mut QueryResponse) -> Result<Option<T>> {
+		let value = match response.results.get_mut(&self) {
+			Some((_, result)) => match result {
+				Ok(val) => val,
 				Err(error) => {
 					let error = mem::replace(error, Error::ConnectionUninitialised.into());
-					map.remove(&self);
+					response.results.swap_remove(&self);
 					return Err(error);
 				}
 			},
@@ -211,28 +217,43 @@ where
 				return Ok(None);
 			}
 		};
-		let result = match &mut vec[..] {
-			[] => Ok(None),
-			[value] => {
+		let result = match value {
+			Value::Array(vec) => match &mut vec.0[..] {
+				[] => Ok(None),
+				[value] => {
+					let value = mem::take(value);
+					from_value(value).map_err(Into::into)
+				}
+				_ => Err(Error::LossyTake(QueryResponse {
+					results: mem::take(&mut response.results),
+					live_queries: mem::take(&mut response.live_queries),
+					..QueryResponse::new()
+				})
+				.into()),
+			},
+			_ => {
 				let value = mem::take(value);
 				from_value(value).map_err(Into::into)
 			}
-			_ => Err(Error::LossyTake(QueryResponse(mem::take(map))).into()),
 		};
-		map.remove(&self);
+		response.results.swap_remove(&self);
 		result
+	}
+
+	fn stats(&self, response: &QueryResponse) -> Option<Stats> {
+		response.results.get(self).map(|x| x.0)
 	}
 }
 
 impl QueryResult<Value> for (usize, &str) {
-	fn query_result(self, QueryResponse(map): &mut QueryResponse) -> Result<Value> {
+	fn query_result(self, response: &mut QueryResponse) -> Result<Value> {
 		let (index, key) = self;
-		let response = match map.get_mut(&index) {
-			Some(result) => match result {
-				Ok(vec) => vec,
+		let value = match response.results.get_mut(&index) {
+			Some((_, result)) => match result {
+				Ok(val) => val,
 				Err(error) => {
 					let error = mem::replace(error, Error::ConnectionUninitialised.into());
-					map.remove(&index);
+					response.results.swap_remove(&index);
 					return Err(error);
 				}
 			},
@@ -240,15 +261,17 @@ impl QueryResult<Value> for (usize, &str) {
 				return Ok(Value::None);
 			}
 		};
-		let mut vec = Vec::with_capacity(response.len());
-		for value in response.iter_mut() {
-			if let Value::Object(Object(object)) = value {
-				if let Some(value) = object.remove(key) {
-					vec.push(value);
-				}
-			}
-		}
-		Ok(vec.into())
+
+		let value = match value {
+			Value::Object(object) => object.remove(key).unwrap_or_default(),
+			_ => Value::None,
+		};
+
+		Ok(value)
+	}
+
+	fn stats(&self, response: &QueryResponse) -> Option<Stats> {
+		response.results.get(&self.0).map(|x| x.0)
 	}
 }
 
@@ -256,14 +279,14 @@ impl<T> QueryResult<Option<T>> for (usize, &str)
 where
 	T: DeserializeOwned,
 {
-	fn query_result(self, QueryResponse(map): &mut QueryResponse) -> Result<Option<T>> {
+	fn query_result(self, response: &mut QueryResponse) -> Result<Option<T>> {
 		let (index, key) = self;
-		let vec = match map.get_mut(&index) {
-			Some(result) => match result {
-				Ok(vec) => vec,
+		let value = match response.results.get_mut(&index) {
+			Some((_, result)) => match result {
+				Ok(val) => val,
 				Err(error) => {
 					let error = mem::replace(error, Error::ConnectionUninitialised.into());
-					map.remove(&index);
+					response.results.swap_remove(&index);
 					return Err(error);
 				}
 			},
@@ -271,33 +294,45 @@ where
 				return Ok(None);
 			}
 		};
-		let mut value = match &mut vec[..] {
-			[] => {
-				map.remove(&index);
-				return Ok(None);
-			}
-			[value] => value,
-			_ => {
-				return Err(Error::LossyTake(QueryResponse(mem::take(map))).into());
-			}
+		let value = match value {
+			Value::Array(vec) => match &mut vec.0[..] {
+				[] => {
+					response.results.swap_remove(&index);
+					return Ok(None);
+				}
+				[value] => value,
+				_ => {
+					return Err(Error::LossyTake(QueryResponse {
+						results: mem::take(&mut response.results),
+						live_queries: mem::take(&mut response.live_queries),
+						..QueryResponse::new()
+					})
+					.into());
+				}
+			},
+			value => value,
 		};
-		match &mut value {
+		match value {
 			Value::None | Value::Null => {
-				map.remove(&index);
+				response.results.swap_remove(&index);
 				Ok(None)
 			}
-			Value::Object(Object(object)) => {
+			Value::Object(object) => {
 				if object.is_empty() {
-					map.remove(&index);
+					response.results.swap_remove(&index);
 					return Ok(None);
 				}
 				let Some(value) = object.remove(key) else {
-                    return Ok(None);
-                };
+					return Ok(None);
+				};
 				from_value(value).map_err(Into::into)
 			}
 			_ => Ok(None),
 		}
+	}
+
+	fn stats(&self, response: &QueryResponse) -> Option<Stats> {
+		response.results.get(&self.0).map(|x| x.0)
 	}
 }
 
@@ -305,14 +340,21 @@ impl<T> QueryResult<Vec<T>> for usize
 where
 	T: DeserializeOwned,
 {
-	fn query_result(self, QueryResponse(map): &mut QueryResponse) -> Result<Vec<T>> {
-		let vec = match map.remove(&self) {
-			Some(result) => result?,
+	fn query_result(self, response: &mut QueryResponse) -> Result<Vec<T>> {
+		let vec = match response.results.swap_remove(&self) {
+			Some((_, result)) => match result? {
+				Value::Array(vec) => vec.0,
+				vec => vec![vec],
+			},
 			None => {
 				return Ok(vec![]);
 			}
 		};
 		from_value(vec.into()).map_err(Into::into)
+	}
+
+	fn stats(&self, response: &QueryResponse) -> Option<Stats> {
+		response.results.get(self).map(|x| x.0)
 	}
 }
 
@@ -320,14 +362,20 @@ impl<T> QueryResult<Vec<T>> for (usize, &str)
 where
 	T: DeserializeOwned,
 {
-	fn query_result(self, QueryResponse(map): &mut QueryResponse) -> Result<Vec<T>> {
+	fn query_result(self, response: &mut QueryResponse) -> Result<Vec<T>> {
 		let (index, key) = self;
-		let response = match map.get_mut(&index) {
-			Some(result) => match result {
-				Ok(vec) => vec,
+		let mut response = match response.results.get_mut(&index) {
+			Some((_, result)) => match result {
+				Ok(val) => match val {
+					Value::Array(vec) => mem::take(&mut vec.0),
+					val => {
+						let val = mem::take(val);
+						vec![val]
+					}
+				},
 				Err(error) => {
 					let error = mem::replace(error, Error::ConnectionUninitialised.into());
-					map.remove(&index);
+					response.results.swap_remove(&index);
 					return Err(error);
 				}
 			},
@@ -337,13 +385,17 @@ where
 		};
 		let mut vec = Vec::with_capacity(response.len());
 		for value in response.iter_mut() {
-			if let Value::Object(Object(object)) = value {
+			if let Value::Object(object) = value {
 				if let Some(value) = object.remove(key) {
 					vec.push(value);
 				}
 			}
 		}
 		from_value(vec.into()).map_err(Into::into)
+	}
+
+	fn stats(&self, response: &QueryResponse) -> Option<Stats> {
+		response.results.get(&self.0).map(|x| x.0)
 	}
 }
 
@@ -368,5 +420,116 @@ where
 {
 	fn query_result(self, response: &mut QueryResponse) -> Result<Vec<T>> {
 		(0, self).query_result(response)
+	}
+}
+
+/// A way to take a query stream future from a query response
+pub trait QueryStream<R> {
+	/// Retrieves the query stream future
+	fn query_stream(self, response: &mut QueryResponse) -> Result<method::QueryStream<R>>;
+}
+
+impl QueryStream<Value> for usize {
+	fn query_stream(self, response: &mut QueryResponse) -> Result<method::QueryStream<Value>> {
+		let stream = response
+			.live_queries
+			.swap_remove(&self)
+			.and_then(|result| match result {
+				Err(crate::Error::Api(Error::NotLiveQuery(..))) => {
+					response.results.swap_remove(&self).and_then(|x| x.1.err().map(Err))
+				}
+				result => Some(result),
+			})
+			.unwrap_or_else(|| match response.results.contains_key(&self) {
+				true => Err(Error::NotLiveQuery(self).into()),
+				false => Err(Error::QueryIndexOutOfBounds(self).into()),
+			})?;
+		Ok(method::QueryStream(Either::Left(stream)))
+	}
+}
+
+impl QueryStream<Value> for () {
+	fn query_stream(self, response: &mut QueryResponse) -> Result<method::QueryStream<Value>> {
+		let mut streams = Vec::with_capacity(response.live_queries.len());
+		for (index, result) in mem::take(&mut response.live_queries) {
+			match result {
+				Ok(stream) => streams.push(stream),
+				Err(crate::Error::Api(Error::NotLiveQuery(..))) => match response.results.swap_remove(&index) {
+					Some((stats, Err(error))) => {
+						response.results.insert(index, (stats, Err(Error::ResponseAlreadyTaken.into())));
+						return Err(error);
+					}
+					Some((_, Ok(..))) => unreachable!("the internal error variant indicates that an error occurred in the `LIVE SELECT` query"),
+					None => { return Err(Error::ResponseAlreadyTaken.into()); }
+				}
+				Err(error) => { return Err(error); }
+			}
+		}
+		Ok(method::QueryStream(Either::Right(select_all(streams))))
+	}
+}
+
+impl<R> QueryStream<Notification<R>> for usize
+where
+	R: DeserializeOwned + Unpin,
+{
+	fn query_stream(
+		self,
+		response: &mut QueryResponse,
+	) -> Result<method::QueryStream<Notification<R>>> {
+		let mut stream = response
+			.live_queries
+			.swap_remove(&self)
+			.and_then(|result| match result {
+				Err(crate::Error::Api(Error::NotLiveQuery(..))) => {
+					response.results.swap_remove(&self).and_then(|x| x.1.err().map(Err))
+				}
+				result => Some(result),
+			})
+			.unwrap_or_else(|| match response.results.contains_key(&self) {
+				true => Err(Error::NotLiveQuery(self).into()),
+				false => Err(Error::QueryIndexOutOfBounds(self).into()),
+			})?;
+		Ok(method::QueryStream(Either::Left(Stream {
+			client: stream.client.clone(),
+			engine: stream.engine,
+			id: mem::take(&mut stream.id),
+			rx: stream.rx.take(),
+			response_type: PhantomData,
+		})))
+	}
+}
+
+impl<R> QueryStream<Notification<R>> for ()
+where
+	R: DeserializeOwned + Unpin,
+{
+	fn query_stream(
+		self,
+		response: &mut QueryResponse,
+	) -> Result<method::QueryStream<Notification<R>>> {
+		let mut streams = Vec::with_capacity(response.live_queries.len());
+		for (index, result) in mem::take(&mut response.live_queries) {
+			let mut stream = match result {
+				Ok(stream) => stream,
+				Err(crate::Error::Api(Error::NotLiveQuery(..))) => match response.results.swap_remove(&index) {
+					Some((stats, Err(error))) => {
+						response.results.insert(index, (stats, Err(Error::ResponseAlreadyTaken.into())));
+						return Err(error);
+					}
+					Some((_, Ok(..))) => unreachable!("the internal error variant indicates that an error occurred in the `LIVE SELECT` query"),
+					None => { return Err(Error::ResponseAlreadyTaken.into()); }
+				}
+				Err(error) => { return Err(error); }
+			};
+			streams.push(Stream {
+				client: stream.client.clone(),
+				engine: stream.engine,
+				id: mem::take(&mut stream.id),
+				rx: stream.rx.take(),
+				response_type: PhantomData,
+			});
+		}
+		Ok(method::QueryStream(Either::Right(select_all(streams))))
 	}
 }

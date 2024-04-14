@@ -5,38 +5,34 @@ pub(crate) mod native;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod wasm;
 
+use crate::api;
 use crate::api::conn::DbResponse;
 use crate::api::conn::Method;
-use crate::api::engine::remote::Status;
+use crate::api::engine::remote::duration_from_str;
 use crate::api::err::Error;
+use crate::api::method::query::QueryResult;
 use crate::api::Connect;
-use crate::api::Response as QueryResponse;
 use crate::api::Result;
 use crate::api::Surreal;
+use crate::dbs::Notification;
+use crate::dbs::QueryMethodResponse;
+use crate::dbs::Status;
+use crate::method::Stats;
 use crate::opt::IntoEndpoint;
-use crate::sql::Array;
 use crate::sql::Value;
-use futures::Stream;
+use indexmap::IndexMap;
+use revision::revisioned;
+use revision::Revisioned;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use std::io::Read;
 use std::marker::PhantomData;
-use std::mem;
-use std::pin::Pin;
-use std::task::Context;
-use std::task::Poll;
 use std::time::Duration;
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::time::Instant;
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::time::Interval;
-#[cfg(target_arch = "wasm32")]
-use wasmtimer::std::Instant;
-#[cfg(target_arch = "wasm32")]
-use wasmtimer::tokio::Interval;
 
 pub(crate) const PATH: &str = "rpc";
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 const PING_METHOD: &str = "ping";
-const LOG: &str = "surrealdb::engine::remote::ws";
+const REVISION_HEADER: &str = "revision";
 
 /// The WS scheme used to connect to `ws://` endpoints
 #[derive(Debug)]
@@ -59,11 +55,12 @@ impl Surreal<Client> {
 	/// # Examples
 	///
 	/// ```no_run
+	/// use once_cell::sync::Lazy;
 	/// use surrealdb::Surreal;
 	/// use surrealdb::engine::remote::ws::Client;
 	/// use surrealdb::engine::remote::ws::Ws;
 	///
-	/// static DB: Surreal<Client> = Surreal::init();
+	/// static DB: Lazy<Surreal<Client>> = Lazy::new(Surreal::init);
 	///
 	/// # #[tokio::main]
 	/// # async fn main() -> surrealdb::Result<()> {
@@ -72,24 +69,37 @@ impl Surreal<Client> {
 	/// # }
 	/// ```
 	pub fn connect<P>(
-		&'static self,
+		&self,
 		address: impl IntoEndpoint<P, Client = Client>,
 	) -> Connect<Client, ()> {
 		Connect {
-			router: Some(&self.router),
+			router: self.router.clone(),
+			engine: PhantomData,
 			address: address.into_endpoint(),
 			capacity: 0,
 			client: PhantomData,
+			waiter: self.waiter.clone(),
 			response_type: PhantomData,
 		}
 	}
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[revisioned(revision = 1)]
 pub(crate) struct Failure {
 	pub(crate) code: i64,
 	pub(crate) message: String,
 }
+
+#[derive(Debug, Deserialize)]
+#[revisioned(revision = 1)]
+pub(crate) enum Data {
+	Other(Value),
+	Query(Vec<QueryMethodResponse>),
+	Live(Notification),
+}
+
+type ServerResult = std::result::Result<Data, Failure>;
 
 impl From<Failure> for Error {
 	fn from(failure: Failure) -> Self {
@@ -103,100 +113,68 @@ impl From<Failure> for Error {
 	}
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum QueryMethodResponse {
-	Value(Value),
-	String(String),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum SuccessValue {
-	Query(Vec<(String, Status, QueryMethodResponse)>),
-	Other(Value),
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) enum Content {
-	#[serde(rename = "result")]
-	Success(SuccessValue),
-	#[serde(rename = "error")]
-	Failure(Failure),
-}
-
 impl DbResponse {
-	fn from((method, content): (Method, Content)) -> Result<Self> {
-		match content {
-			Content::Success(SuccessValue::Query(results)) => Ok(DbResponse::Query(QueryResponse(
-				results
-					.into_iter()
-					.map(|(_duration, status, result)| match status {
-						Status::Ok => match result {
-							QueryMethodResponse::Value(value) => match value {
-								Value::Array(Array(values)) => Ok(values),
-								Value::None | Value::Null => Ok(vec![]),
-								value => Ok(vec![value]),
-							},
-							QueryMethodResponse::String(string) => Ok(vec![string.into()]),
-						},
-						Status::Err => match result {
-							QueryMethodResponse::Value(message) => {
-								Err(Error::Query(message.to_string()).into())
-							}
-							QueryMethodResponse::String(message) => {
-								Err(Error::Query(message).into())
-							}
-						},
-					})
-					.enumerate()
-					.collect(),
-			))),
-			Content::Success(SuccessValue::Other(mut value)) => {
-				if let Method::Create | Method::Delete = method {
-					if let Value::Array(Array(array)) = &mut value {
-						match &mut array[..] {
-							[] => {
-								value = Value::None;
-							}
-							[v] => {
-								value = mem::take(v);
-							}
-							_ => {}
+	fn from(result: ServerResult) -> Result<Self> {
+		match result.map_err(Error::from)? {
+			Data::Other(value) => Ok(DbResponse::Other(value)),
+			Data::Query(responses) => {
+				let mut map =
+					IndexMap::<usize, (Stats, QueryResult)>::with_capacity(responses.len());
+
+				for (index, response) in responses.into_iter().enumerate() {
+					let stats = Stats {
+						execution_time: duration_from_str(&response.time),
+					};
+					match response.status {
+						Status::Ok => {
+							map.insert(index, (stats, Ok(response.result)));
 						}
+						Status::Err => {
+							map.insert(
+								index,
+								(stats, Err(Error::Query(response.result.as_raw_string()).into())),
+							);
+						}
+						_ => unreachable!(),
 					}
 				}
-				Ok(DbResponse::Other(value))
+
+				Ok(DbResponse::Query(api::Response {
+					results: map,
+					..api::Response::new()
+				}))
 			}
-			Content::Failure(failure) => Err(Error::from(failure).into()),
+			// Live notifications don't call this method
+			Data::Live(..) => unreachable!(),
 		}
 	}
 }
 
 #[derive(Debug, Deserialize)]
+#[revisioned(revision = 1)]
 pub(crate) struct Response {
-	#[serde(skip_serializing_if = "Option::is_none")]
 	id: Option<Value>,
-	#[serde(flatten)]
-	pub(crate) content: Content,
+	pub(crate) result: ServerResult,
 }
 
-struct IntervalStream {
-	inner: Interval,
-}
-
-impl IntervalStream {
-	fn new(interval: Interval) -> Self {
-		Self {
-			inner: interval,
-		}
+fn serialize(value: &Value, revisioned: bool) -> Result<Vec<u8>> {
+	if revisioned {
+		let mut buf = Vec::new();
+		value.serialize_revisioned(&mut buf).map_err(|error| crate::Error::Db(error.into()))?;
+		return Ok(buf);
 	}
+	crate::sql::serde::serialize(value).map_err(|error| crate::Error::Db(error.into()))
 }
 
-impl Stream for IntervalStream {
-	type Item = Instant;
-
-	fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Instant>> {
-		self.inner.poll_tick(cx).map(Some)
+fn deserialize<A, T>(bytes: &mut A, revisioned: bool) -> Result<T>
+where
+	A: Read,
+	T: Revisioned + DeserializeOwned,
+{
+	if revisioned {
+		return T::deserialize_revisioned(bytes).map_err(|x| crate::Error::Db(x.into()));
 	}
+	let mut buf = Vec::new();
+	bytes.read_to_end(&mut buf).map_err(crate::err::Error::Io)?;
+	crate::sql::serde::deserialize(&buf).map_err(|error| crate::Error::Db(error.into()))
 }

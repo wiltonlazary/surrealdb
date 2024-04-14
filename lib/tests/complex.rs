@@ -2,11 +2,11 @@
 
 mod parse;
 use parse::Parse;
-use std::future::Future;
-use std::thread::Builder;
+mod helpers;
+use helpers::new_ds;
+use helpers::with_enough_stack;
 use surrealdb::dbs::Session;
 use surrealdb::err::Error;
-use surrealdb::kvs::Datastore;
 use surrealdb::sql::Value;
 
 #[test]
@@ -23,7 +23,7 @@ fn self_referential_field() -> Result<(), Error> {
 		assert_eq!(res.len(), 1);
 		//
 		let tmp = res.next().unwrap();
-		assert!(matches!(tmp, Err(Error::ComputationDepthExceeded)));
+		assert!(matches!(tmp, Err(Error::ComputationDepthExceeded)), "found {:?}", tmp);
 		//
 		Ok(())
 	})
@@ -43,7 +43,7 @@ fn cyclic_fields() -> Result<(), Error> {
 		assert_eq!(res.len(), 1);
 		//
 		let tmp = res.next().unwrap();
-		assert!(matches!(tmp, Err(Error::ComputationDepthExceeded)));
+		assert!(matches!(tmp, Err(Error::ComputationDepthExceeded)), "found {:?}", tmp);
 		//
 		Ok(())
 	})
@@ -67,7 +67,7 @@ fn cyclic_records() -> Result<(), Error> {
 		assert!(tmp.is_ok());
 		//
 		let tmp = res.next().unwrap();
-		assert!(matches!(tmp, Err(Error::ComputationDepthExceeded)));
+		assert!(matches!(tmp, Err(Error::ComputationDepthExceeded)), "found {:?}", tmp);
 		//
 		Ok(())
 	})
@@ -126,7 +126,7 @@ fn ok_graph_traversal_depth() -> Result<(), Error> {
 		ret.push_str(" AS res FROM node:0;\n");
 		ret
 	}
-	// Test different traveral depths
+	// Test different traversal depths
 	for n in 1..=40 {
 		// Ensure a good stack size for tests
 		with_enough_stack(async move {
@@ -166,7 +166,7 @@ fn ok_graph_traversal_depth() -> Result<(), Error> {
 fn ok_cast_chain_depth() -> Result<(), Error> {
 	// Ensure a good stack size for tests
 	with_enough_stack(async {
-		// Run a chasting query which succeeds
+		// Run a casting query which succeeds
 		let mut res = run_queries(&cast_chain(10)).await?;
 		//
 		assert_eq!(res.len(), 1);
@@ -183,13 +183,24 @@ fn ok_cast_chain_depth() -> Result<(), Error> {
 fn excessive_cast_chain_depth() -> Result<(), Error> {
 	// Ensure a good stack size for tests
 	with_enough_stack(async {
-		// Run a casting query which will fail
-		let mut res = run_queries(&cast_chain(35)).await?;
-		//
-		assert_eq!(res.len(), 1);
-		//
-		let tmp = res.next().unwrap();
-		assert!(matches!(tmp, Err(Error::ComputationDepthExceeded)));
+		// Run a casting query which will fail (either while parsing or executing)
+		match run_queries(&cast_chain(125)).await {
+			Ok(mut res) => {
+				assert_eq!(res.len(), 1);
+				//
+				let tmp = res.next().unwrap();
+				assert!(
+					matches!(tmp, Err(Error::ComputationDepthExceeded)),
+					"didn't return a computation depth exceeded: {:?}",
+					tmp
+				);
+			}
+			Err(e) => assert!(
+				matches!(e, Error::InvalidQuery(_)),
+				"didn't return a computation depth exceeded: {:?}",
+				e
+			),
+		}
 		//
 		Ok(())
 	})
@@ -198,33 +209,12 @@ fn excessive_cast_chain_depth() -> Result<(), Error> {
 async fn run_queries(
 	sql: &str,
 ) -> Result<
-	impl Iterator<Item = Result<Value, Error>> + ExactSizeIterator + DoubleEndedIterator + 'static,
+	impl ExactSizeIterator<Item = Result<Value, Error>> + DoubleEndedIterator + 'static,
 	Error,
 > {
-	let dbs = Datastore::new("memory").await?;
-	let ses = Session::for_kv().with_ns("test").with_db("test");
-	dbs.execute(&sql, &ses, None, false).await.map(|v| v.into_iter().map(|res| res.result))
-}
-
-fn with_enough_stack(
-	fut: impl Future<Output = Result<(), Error>> + Send + 'static,
-) -> Result<(), Error> {
-	#[allow(unused_mut)]
-	let mut builder = Builder::new();
-
-	#[cfg(debug_assertions)]
-	{
-		builder = builder.stack_size(16_000_000);
-	}
-
-	builder
-		.spawn(|| {
-			let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
-			runtime.block_on(fut)
-		})
-		.unwrap()
-		.join()
-		.unwrap()
+	let dbs = new_ds().await?;
+	let ses = Session::owner().with_ns("test").with_db("test");
+	dbs.execute(sql, &ses, None).await.map(|v| v.into_iter().map(|res| res.result))
 }
 
 fn cast_chain(n: usize) -> String {

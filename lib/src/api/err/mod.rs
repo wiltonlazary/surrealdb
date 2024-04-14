@@ -1,14 +1,16 @@
 use crate::api::Response;
 use crate::sql::Array;
 use crate::sql::Edges;
+use crate::sql::FromValueError;
 use crate::sql::Object;
 use crate::sql::Thing;
 use crate::sql::Value;
+use serde::Serialize;
 use std::io;
 use std::path::PathBuf;
 use thiserror::Error;
 
-/// An error originating from a remote SurrealDB database.
+/// An error originating from a remote SurrealDB database
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
@@ -17,11 +19,11 @@ pub enum Error {
 	Query(String),
 
 	/// There was an error processing a remote HTTP request
-	#[error("There was an error processing a remote HTTP request")]
+	#[error("There was an error processing a remote HTTP request: {0}")]
 	Http(String),
 
 	/// There was an error processing a remote WS request
-	#[error("There was an error processing a remote WS request")]
+	#[error("There was an error processing a remote WS request: {0}")]
 	Ws(String),
 
 	/// The specified scheme does not match any supported protocol or storage engine
@@ -31,6 +33,10 @@ pub enum Error {
 	/// Tried to run database queries without initialising the connection first
 	#[error("Connection uninitialised")]
 	ConnectionUninitialised,
+
+	/// Tried to call `connect` on an instance already connected
+	#[error("Already connected")]
+	AlreadyConnected,
 
 	/// `Query::bind` not called with an object nor a key/value tuple
 	#[error("Invalid bindings: {0}")]
@@ -98,7 +104,7 @@ pub enum Error {
 	#[error("Failed to deserialize a binary response: {error}")]
 	ResponseFromBinary {
 		binary: Vec<u8>,
-		error: bung::decode::Error,
+		error: bincode::Error,
 	},
 
 	/// Failed to serialize `sql::Value` to JSON string
@@ -108,8 +114,8 @@ pub enum Error {
 		error: String,
 	},
 
-	/// Failed to serialize `sql::Value` to JSON string
-	#[error("Failed to serialize `{string}` to JSON string: {error}")]
+	/// Failed to deserialize from JSON string to `sql::Value`
+	#[error("Failed to deserialize `{string}` to sql::Value: {error}")]
 	FromJsonString {
 		string: String,
 		error: String,
@@ -146,10 +152,60 @@ pub enum Error {
 	#[error("The protocol or storage engine does not support backups on this architecture")]
 	BackupsNotSupported,
 
-	/// The protocol or storage engine being used does not support authentication on the
-	/// architecture it's running on
-	#[error("The protocol or storage engine does not support authentication on this architecture")]
-	AuthNotSupported,
+	/// The version of the server is not compatible with the versions supported by this SDK
+	#[error("server version `{server_version}` does not match the range supported by the client `{supported_versions}`")]
+	VersionMismatch {
+		server_version: semver::Version,
+		supported_versions: String,
+	},
+
+	/// The build metadata of the server is older than the minimum supported by this SDK
+	#[error("server build `{server_metadata}` is older than the minimum supported build `{supported_metadata}`")]
+	BuildMetadataMismatch {
+		server_metadata: semver::BuildMetadata,
+		supported_metadata: semver::BuildMetadata,
+	},
+
+	/// The protocol or storage engine being used does not support live queries on the architecture
+	/// it's running on
+	#[error("The protocol or storage engine does not support live queries on this architecture")]
+	LiveQueriesNotSupported,
+
+	/// Tried to use a range query on an object
+	#[error("Live queries on objects not supported: {0}")]
+	LiveOnObject(Object),
+
+	/// Tried to use a range query on an array
+	#[error("Live queries on arrays not supported: {0}")]
+	LiveOnArray(Array),
+
+	/// Tried to use a range query on an edge or edges
+	#[error("Live queries on edges not supported: {0}")]
+	LiveOnEdges(Edges),
+
+	/// Tried to access a query statement as a live query when it isn't a live query
+	#[error("Query statement {0} is not a live query")]
+	NotLiveQuery(usize),
+
+	/// Tried to access a query statement falling outside the bounds of the statements supplied
+	#[error("Query statement {0} is out of bounds")]
+	QueryIndexOutOfBounds(usize),
+
+	/// Called `Response::take` or `Response::stream` on a query response more than once
+	#[error("Tried to take a query response that has already been taken")]
+	ResponseAlreadyTaken,
+
+	/// Tried to insert on an object
+	#[error("Insert queries on objects not supported: {0}")]
+	InsertOnObject(Object),
+
+	/// Tried to insert on an array
+	#[error("Insert queries on arrays not supported: {0}")]
+	InsertOnArray(Array),
+
+	/// Tried to insert on an edge or edges
+	#[error("Insert queries on edges not supported: {0}")]
+	InsertOnEdges(Edges),
 }
 
 #[cfg(feature = "protocol-http")]
@@ -198,5 +254,23 @@ impl From<ws_stream_wasm::WsErr> for crate::Error {
 impl From<pharos::PharErr> for crate::Error {
 	fn from(error: pharos::PharErr) -> Self {
 		Self::Api(Error::Ws(error.to_string()))
+	}
+}
+
+impl Serialize for Error {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		serializer.serialize_str(self.to_string().as_str())
+	}
+}
+
+impl From<FromValueError> for crate::Error {
+	fn from(error: FromValueError) -> Self {
+		Self::Api(Error::FromValue {
+			value: error.value,
+			error: error.error,
+		})
 	}
 }

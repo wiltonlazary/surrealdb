@@ -11,7 +11,7 @@
 #![forbid(unsafe_code)]
 
 #[macro_use]
-extern crate log;
+extern crate tracing;
 
 #[macro_use]
 mod mac;
@@ -21,13 +21,29 @@ mod cnf;
 mod dbs;
 mod env;
 mod err;
-mod iam;
+mod mem;
 mod net;
-mod o11y;
+mod node;
 mod rpc;
+mod telemetry;
 
+use std::future::Future;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-	cli::init() // Initiate the command line
+	// Initiate the command line
+	with_enough_stack(cli::init())
+}
+
+/// Rust's default thread stack size of 2MiB doesn't allow sufficient recursion depth.
+fn with_enough_stack<T>(fut: impl Future<Output = T> + Send) -> T {
+	// Start a Tokio runtime with custom configuration
+	tokio::runtime::Builder::new_multi_thread()
+		.enable_all()
+		.max_blocking_threads(*cnf::RUNTIME_MAX_BLOCKING_THREADS)
+		.thread_stack_size(*cnf::RUNTIME_STACK_SIZE)
+		.thread_name("surrealdb-worker")
+		.build()
+		.unwrap()
+		.block_on(fut)
 }

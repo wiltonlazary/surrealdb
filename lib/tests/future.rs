@@ -1,8 +1,9 @@
 mod parse;
 use parse::Parse;
+mod helpers;
+use helpers::new_ds;
 use surrealdb::dbs::Session;
 use surrealdb::err::Error;
-use surrealdb::kvs::Datastore;
 use surrealdb::sql::Value;
 
 #[tokio::test]
@@ -12,9 +13,9 @@ async fn future_function_simple() -> Result<(), Error> {
 		UPDATE person:test SET birthday = <datetime> '2007-06-22';
 		UPDATE person:test SET birthday = <datetime> '2001-06-22';
 	";
-	let dbs = Datastore::new("memory").await?;
-	let ses = Session::for_kv().with_ns("test").with_db("test");
-	let res = &mut dbs.execute(&sql, &ses, None, false).await?;
+	let dbs = new_ds().await?;
+	let ses = Session::owner().with_ns("test").with_db("test");
+	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 3);
 	//
 	let tmp = res.remove(0).result?;
@@ -23,12 +24,12 @@ async fn future_function_simple() -> Result<(), Error> {
 	//
 	let tmp = res.remove(0).result?;
 	let val =
-		Value::parse("[{ id: person:test, birthday: '2007-06-22T00:00:00Z', can_drive: false }]");
+		Value::parse("[{ id: person:test, birthday: d'2007-06-22T00:00:00Z', can_drive: false }]");
 	assert_eq!(tmp, val);
 	//
 	let tmp = res.remove(0).result?;
 	let val =
-		Value::parse("[{ id: person:test, birthday: '2001-06-22T00:00:00Z', can_drive: true }]");
+		Value::parse("[{ id: person:test, birthday: d'2001-06-22T00:00:00Z', can_drive: true }]");
 	assert_eq!(tmp, val);
 	//
 	Ok(())
@@ -44,9 +45,9 @@ async fn future_function_arguments() -> Result<(), Error> {
 			y = 'b-' + parse::email::user(b)
 		;
 	";
-	let dbs = Datastore::new("memory").await?;
-	let ses = Session::for_kv().with_ns("test").with_db("test");
-	let res = &mut dbs.execute(&sql, &ses, None, false).await?;
+	let dbs = new_ds().await?;
+	let ses = Session::owner().with_ns("test").with_db("test");
+	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 1);
 	//
 	let tmp = res.remove(0).result?;
@@ -55,7 +56,7 @@ async fn future_function_arguments() -> Result<(), Error> {
 			{
 				a: 'test@surrealdb.com',
 				b: 'test@surrealdb.com',
-				id: 'future:test',
+				id: future:test,
 				x: 'a-test',
 				y: 'b-test',
 			}
@@ -88,12 +89,12 @@ async fn concurrency() -> Result<(), Error> {
 		)
 	}
 
-	/// Returns `true` iif `limit` futures are concurrently executed.
+	/// Returns `true` if `limit` futures are concurrently executed.
 	async fn test_limit(limit: usize) -> Result<bool, Error> {
 		let sql = query(limit, MILLIS);
-		let dbs = Datastore::new("memory").await?;
-		let ses = Session::for_kv().with_ns("test").with_db("test");
-		let res = dbs.execute(&sql, &ses, None, false).await;
+		let dbs = new_ds().await?;
+		let ses = Session::owner().with_ns("test").with_db("test");
+		let res = dbs.execute(&sql, &ses, None).await;
 
 		if matches!(res, Err(Error::QueryTimedout)) {
 			Ok(false)

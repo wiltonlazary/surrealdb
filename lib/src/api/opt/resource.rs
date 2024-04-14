@@ -1,20 +1,9 @@
-use crate::api::err::Error;
-use crate::api::Result;
-use crate::sql;
-use crate::sql::Array;
-use crate::sql::Edges;
-use crate::sql::Id;
-use crate::sql::Object;
-use crate::sql::Table;
-use crate::sql::Thing;
-use crate::sql::Value;
-use serde::Serialize;
-use std::ops;
-use std::ops::Bound;
+use crate::api::{err::Error, Result};
+use crate::sql::{self, Array, Edges, Id, Object, Table, Thing, Value};
+use crate::syn;
+use std::ops::{self, Bound};
 
 /// A database resource
-#[derive(Serialize)]
-#[serde(untagged)]
 #[derive(Debug)]
 pub enum Resource {
 	/// Table name
@@ -30,14 +19,9 @@ pub enum Resource {
 }
 
 impl Resource {
-	pub(crate) fn with_range(self, range: Range<Id>) -> Result<Value> {
+	pub(crate) fn with_range(self, range: Range<Id>) -> Result<sql::Range> {
 		match self {
-			Resource::Table(Table(table)) => Ok(sql::Range {
-				tb: table,
-				beg: range.start,
-				end: range.end,
-			}
-			.into()),
+			Resource::Table(table) => Ok(sql::Range::new(table.0, range.start, range.end)),
 			Resource::RecordId(record_id) => Err(Error::RangeOnRecordId(record_id).into()),
 			Resource::Object(object) => Err(Error::RangeOnObject(object).into()),
 			Resource::Array(array) => Err(Error::RangeOnArray(array).into()),
@@ -52,9 +36,21 @@ impl From<Table> for Resource {
 	}
 }
 
+impl From<&Table> for Resource {
+	fn from(table: &Table) -> Self {
+		Self::Table(table.clone())
+	}
+}
+
 impl From<Thing> for Resource {
 	fn from(thing: Thing) -> Self {
 		Self::RecordId(thing)
+	}
+}
+
+impl From<&Thing> for Resource {
+	fn from(thing: &Thing) -> Self {
+		Self::RecordId(thing.clone())
 	}
 }
 
@@ -64,9 +60,21 @@ impl From<Object> for Resource {
 	}
 }
 
+impl From<&Object> for Resource {
+	fn from(object: &Object) -> Self {
+		Self::Object(object.clone())
+	}
+}
+
 impl From<Array> for Resource {
 	fn from(array: Array) -> Self {
 		Self::Array(array)
+	}
+}
+
+impl From<&Array> for Resource {
+	fn from(array: &Array) -> Self {
+		Self::Array(array.clone())
 	}
 }
 
@@ -76,9 +84,15 @@ impl From<Edges> for Resource {
 	}
 }
 
+impl From<&Edges> for Resource {
+	fn from(edges: &Edges) -> Self {
+		Self::Edges(edges.clone())
+	}
+}
+
 impl From<&str> for Resource {
 	fn from(s: &str) -> Self {
-		match sql::thing(s) {
+		match syn::thing(s) {
 			Ok(thing) => Self::RecordId(thing),
 			Err(_) => Self::Table(s.into()),
 		}
@@ -93,7 +107,7 @@ impl From<&String> for Resource {
 
 impl From<String> for Resource {
 	fn from(s: String) -> Self {
-		match sql::thing(s.as_str()) {
+		match syn::thing(s.as_str()) {
 			Ok(thing) => Self::RecordId(thing),
 			Err(_) => Self::Table(s.into()),
 		}
@@ -147,6 +161,12 @@ impl<R> IntoResource<Option<R>> for Thing {
 	}
 }
 
+impl<R> IntoResource<Option<R>> for &Thing {
+	fn into_resource(self) -> Result<Resource> {
+		Ok(Resource::RecordId(self.clone()))
+	}
+}
+
 impl<R, T, I> IntoResource<Option<R>> for (T, I)
 where
 	T: Into<String>,
@@ -195,21 +215,25 @@ fn blacklist_colon(input: &str) -> Result<()> {
 impl<R> IntoResource<Vec<R>> for &str {
 	fn into_resource(self) -> Result<Resource> {
 		blacklist_colon(self)?;
-		Ok(Resource::Table(Table(self.to_owned())))
+		let mut table = Table::default();
+		table.0 = self.to_owned();
+		Ok(Resource::Table(table))
 	}
 }
 
 impl<R> IntoResource<Vec<R>> for &String {
 	fn into_resource(self) -> Result<Resource> {
 		blacklist_colon(self)?;
-		Ok(Resource::Table(Table(self.to_owned())))
+		IntoResource::<Vec<R>>::into_resource(self.as_str())
 	}
 }
 
 impl<R> IntoResource<Vec<R>> for String {
 	fn into_resource(self) -> Result<Resource> {
 		blacklist_colon(&self)?;
-		Ok(Resource::Table(Table(self)))
+		let mut table = Table::default();
+		table.0 = self;
+		Ok(Resource::Table(table))
 	}
 }
 

@@ -34,16 +34,20 @@ Temporary Items
 # -----------------------------------
 
 /target/
+/lib/cache/
+/lib/store/
 /lib/target/
 .idea/
+.vscode/
 /result
 /bin/
-/docker/
 /.direnv/
 
 # -----------------------------------
 # Specific
 # -----------------------------------
 
+/cache/
+/store/
 surreal
 history.txt

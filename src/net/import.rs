@@ -1,60 +1,62 @@
-use crate::cli::CF;
+use super::headers::Accept;
 use crate::dbs::DB;
 use crate::err::Error;
 use crate::net::input::bytes_to_utf8;
 use crate::net::output;
-use crate::net::session;
+use axum::extract::DefaultBodyLimit;
+use axum::response::IntoResponse;
+use axum::routing::post;
+use axum::Extension;
+use axum::Router;
+use axum::TypedHeader;
 use bytes::Bytes;
+use http_body::Body as HttpBody;
 use surrealdb::dbs::Session;
-use warp::http;
-use warp::Filter;
+use surrealdb::iam::Action::Edit;
+use surrealdb::iam::ResourceKind::Any;
+use tower_http::limit::RequestBodyLimitLayer;
 
-const MAX: u64 = 1024 * 1024 * 1024 * 4; // 4 GiB
+const MAX: usize = 1024 * 1024 * 1024 * 4; // 4 GiB
 
-#[allow(opaque_hidden_inferred_bound)]
-pub fn config() -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
-	warp::path("import")
-		.and(warp::path::end())
-		.and(warp::post())
-		.and(warp::header::<String>(http::header::ACCEPT.as_str()))
-		.and(warp::body::content_length_limit(MAX))
-		.and(warp::body::bytes())
-		.and(session::build())
-		.and_then(handler)
+pub(super) fn router<S, B>() -> Router<S, B>
+where
+	B: HttpBody + Send + 'static,
+	B::Data: Send,
+	B::Error: std::error::Error + Send + Sync + 'static,
+	S: Clone + Send + Sync + 'static,
+{
+	Router::new()
+		.route("/import", post(handler))
+		.route_layer(DefaultBodyLimit::disable())
+		.layer(RequestBodyLimitLayer::new(MAX))
 }
 
 async fn handler(
-	output: String,
+	Extension(session): Extension<Session>,
+	accept: Option<TypedHeader<Accept>>,
 	sql: Bytes,
-	session: Session,
-) -> Result<impl warp::Reply, warp::Rejection> {
-	// Check the permissions
-	match session.au.is_db() {
-		true => {
-			// Get the datastore reference
-			let db = DB.get().unwrap();
-			// Get local copy of options
-			let opt = CF.get().unwrap();
-			// Convert the body to a byte slice
-			let sql = bytes_to_utf8(&sql)?;
-			// Execute the sql query in the database
-			match db.execute(sql, &session, None, opt.strict).await {
-				Ok(res) => match output.as_ref() {
-					// Simple serialization
-					"application/json" => Ok(output::json(&res)),
-					"application/cbor" => Ok(output::cbor(&res)),
-					"application/pack" => Ok(output::pack(&res)),
-					// Internal serialization
-					"application/bung" => Ok(output::full(&res)),
-					// Return nothing
-					"application/octet-stream" => Ok(output::none()),
-					// An incorrect content-type was requested
-					_ => Err(warp::reject::custom(Error::InvalidType)),
-				},
-				// There was an error when executing the query
-				Err(err) => Err(warp::reject::custom(Error::from(err))),
-			}
-		}
-		_ => Err(warp::reject::custom(Error::InvalidAuth)),
+) -> Result<impl IntoResponse, impl IntoResponse> {
+	// Get the datastore reference
+	let db = DB.get().unwrap();
+	// Convert the body to a byte slice
+	let sql = bytes_to_utf8(&sql)?;
+	// Check the permissions level
+	db.check(&session, Edit, Any.on_level(session.au.level().to_owned()))?;
+	// Execute the sql query in the database
+	match db.import(sql, &session).await {
+		Ok(res) => match accept.as_deref() {
+			// Simple serialization
+			Some(Accept::ApplicationJson) => Ok(output::json(&output::simplify(res))),
+			Some(Accept::ApplicationCbor) => Ok(output::cbor(&output::simplify(res))),
+			Some(Accept::ApplicationPack) => Ok(output::pack(&output::simplify(res))),
+			// Return nothing
+			Some(Accept::ApplicationOctetStream) => Ok(output::none()),
+			// Internal serialization
+			Some(Accept::Surrealdb) => Ok(output::full(&res)),
+			// An incorrect content-type was requested
+			_ => Err(Error::InvalidType),
+		},
+		// There was an error when executing the query
+		Err(err) => Err(Error::from(err)),
 	}
 }

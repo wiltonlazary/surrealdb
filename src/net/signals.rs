@@ -1,4 +1,65 @@
-use crate::err::Error;
+use axum_server::Handle;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+use crate::{err::Error, rpc, telemetry};
+
+/// Start a graceful shutdown:
+/// * Signal the Axum Handle when a shutdown signal is received.
+/// * Stop all WebSocket connections.
+/// * Flush all telemetry data.
+///
+/// A second signal will force an immediate shutdown.
+pub fn graceful_shutdown(ct: CancellationToken, http_handle: Handle) -> JoinHandle<()> {
+	tokio::spawn(async move {
+		let result = listen().await.expect("Failed to listen to shutdown signal");
+		info!(target: super::LOG, "{} received. Waiting for graceful shutdown... A second signal will force an immediate shutdown", result);
+
+		let shutdown = {
+			let http_handle = http_handle.clone();
+			let ct = ct.clone();
+
+			tokio::spawn(async move {
+				// Stop accepting new HTTP requests and wait until all connections are closed
+				http_handle.graceful_shutdown(None);
+				while http_handle.connection_count() > 0 {
+					tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+				}
+
+				rpc::graceful_shutdown().await;
+
+				ct.cancel();
+
+				// Flush all telemetry data
+				if let Err(err) = telemetry::shutdown() {
+					error!("Failed to flush telemetry data: {}", err);
+				}
+			})
+		};
+
+		tokio::select! {
+			// Start a normal graceful shutdown
+			_ = shutdown => (),
+			// Force an immediate shutdown if a second signal is received
+			_ = async {
+				if let Ok(signal) = listen().await {
+					warn!(target: super::LOG, "{} received during graceful shutdown. Terminate immediately...", signal);
+				} else {
+					error!(target: super::LOG, "Failed to listen to shutdown signal. Terminate immediately...");
+				}
+
+				// Force an immediate shutdown
+				http_handle.shutdown();
+
+				// Close all WebSocket connections immediately
+				rpc::shutdown();
+
+				// Cancel cancellation token
+				ct.cancel();
+			} => (),
+		}
+	})
+}
 
 #[cfg(unix)]
 pub async fn listen() -> Result<String, Error> {
@@ -11,7 +72,7 @@ pub async fn listen() -> Result<String, Error> {
 	let mut sigterm = signal(SignalKind::terminate())?;
 	// Listen and wait for the system signals
 	tokio::select! {
-		// Wait for a SIGQUIT signal
+		// Wait for a SIGHUP signal
 		_ = sighup.recv() => {
 			Ok(String::from("SIGHUP"))
 		}

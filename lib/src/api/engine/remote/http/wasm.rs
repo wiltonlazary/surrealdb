@@ -1,5 +1,4 @@
 use super::Client;
-use super::LOG;
 use crate::api::conn::Connection;
 use crate::api::conn::DbResponse;
 use crate::api::conn::Method;
@@ -7,14 +6,14 @@ use crate::api::conn::Param;
 use crate::api::conn::Route;
 use crate::api::conn::Router;
 use crate::api::opt::Endpoint;
-use crate::api::ExtraFeatures;
+use crate::api::OnceLockExt;
 use crate::api::Result;
 use crate::api::Surreal;
+use crate::opt::WaitFor;
 use flume::Receiver;
 use flume::Sender;
 use futures::StreamExt;
 use indexmap::IndexMap;
-use once_cell::sync::OnceCell;
 use reqwest::header::HeaderMap;
 use reqwest::ClientBuilder;
 use std::collections::HashSet;
@@ -23,6 +22,8 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use tokio::sync::watch;
 use url::Url;
 use wasm_bindgen_futures::spawn_local;
 
@@ -49,32 +50,28 @@ impl Connection for Client {
 
 			router(address, conn_tx, route_rx);
 
-			if let Err(error) = conn_rx.into_recv_async().await? {
-				return Err(error);
-			}
-
-			let mut features = HashSet::new();
-			features.insert(ExtraFeatures::Auth);
+			conn_rx.into_recv_async().await??;
 
 			Ok(Surreal {
-				router: OnceCell::with_value(Arc::new(Router {
-					features,
-					conn: PhantomData,
+				router: Arc::new(OnceLock::with_value(Router {
+					features: HashSet::new(),
 					sender: route_tx,
 					last_id: AtomicI64::new(0),
 				})),
+				waiter: Arc::new(watch::channel(Some(WaitFor::Connection))),
+				engine: PhantomData,
 			})
 		})
 	}
 
 	fn send<'r>(
 		&'r mut self,
-		router: &'r Router<Self>,
+		router: &'r Router,
 		param: Param,
 	) -> Pin<Box<dyn Future<Output = Result<Receiver<Result<DbResponse>>>> + Send + Sync + 'r>> {
 		Box::pin(async move {
 			let (sender, receiver) = flume::bounded(1);
-			trace!(target: LOG, "{param:?}");
+			trace!("{param:?}");
 			let route = Route {
 				request: (0, self.method, param),
 				response: sender,
@@ -100,7 +97,7 @@ pub(crate) fn router(
 	route_rx: Receiver<Option<Route>>,
 ) {
 	spawn_local(async move {
-		let base_url = address.endpoint;
+		let base_url = address.url;
 
 		let client = match client(&base_url).await {
 			Ok(client) => {
@@ -108,7 +105,7 @@ pub(crate) fn router(
 				client
 			}
 			Err(error) => {
-				let _ = conn_tx.into_send_async(Err(error.into())).await;
+				let _ = conn_tx.into_send_async(Err(error)).await;
 				return;
 			}
 		};

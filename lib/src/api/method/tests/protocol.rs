@@ -9,16 +9,18 @@ use crate::api::opt::Endpoint;
 use crate::api::opt::IntoEndpoint;
 use crate::api::Connect;
 use crate::api::ExtraFeatures;
+use crate::api::OnceLockExt;
 use crate::api::Result;
 use crate::api::Surreal;
 use flume::Receiver;
-use once_cell::sync::OnceCell;
 use std::collections::HashSet;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use tokio::sync::watch;
 use url::Url;
 
 #[derive(Debug)]
@@ -28,12 +30,7 @@ impl IntoEndpoint<Test> for () {
 	type Client = Client;
 
 	fn into_endpoint(self) -> Result<Endpoint> {
-		Ok(Endpoint {
-			endpoint: Url::parse("test://")?,
-			strict: false,
-			#[cfg(any(feature = "native-tls", feature = "rustls"))]
-			tls_config: None,
-		})
+		Ok(Endpoint::new(Url::parse("test://")?))
 	}
 }
 
@@ -44,14 +41,16 @@ pub struct Client {
 
 impl Surreal<Client> {
 	pub fn connect<P>(
-		&'static self,
+		&self,
 		address: impl IntoEndpoint<P, Client = Client>,
 	) -> Connect<Client, ()> {
 		Connect {
-			router: Some(&self.router),
+			router: self.router.clone(),
+			engine: PhantomData,
 			address: address.into_endpoint(),
 			capacity: 0,
 			client: PhantomData,
+			waiter: self.waiter.clone(),
 			response_type: PhantomData,
 		}
 	}
@@ -73,24 +72,24 @@ impl Connection for Client {
 		Box::pin(async move {
 			let (route_tx, route_rx) = flume::bounded(capacity);
 			let mut features = HashSet::new();
-			features.insert(ExtraFeatures::Auth);
 			features.insert(ExtraFeatures::Backup);
 			let router = Router {
 				features,
-				conn: PhantomData,
 				sender: route_tx,
 				last_id: AtomicI64::new(0),
 			};
 			server::mock(route_rx);
 			Ok(Surreal {
-				router: OnceCell::with_value(Arc::new(router)),
+				router: Arc::new(OnceLock::with_value(router)),
+				waiter: Arc::new(watch::channel(None)),
+				engine: PhantomData,
 			})
 		})
 	}
 
 	fn send<'r>(
 		&'r mut self,
-		router: &'r Router<Self>,
+		router: &'r Router,
 		param: Param,
 	) -> Pin<Box<dyn Future<Output = Result<Receiver<Result<DbResponse>>>> + Send + Sync + 'r>> {
 		Box::pin(async move {

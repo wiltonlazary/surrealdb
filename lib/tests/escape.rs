@@ -1,8 +1,9 @@
 mod parse;
 use parse::Parse;
+mod helpers;
+use helpers::new_ds;
 use surrealdb::dbs::Session;
 use surrealdb::err::Error;
-use surrealdb::kvs::Datastore;
 use surrealdb::sql::Value;
 
 #[tokio::test]
@@ -10,15 +11,15 @@ async fn complex_ids() -> Result<(), Error> {
 	let sql = r#"
 		CREATE person:100 SET test = 'One';
 		CREATE person:00100;
-		CREATE 'person:100';
-		CREATE "person:100";
+		CREATE r'person:100';
+		CREATE r"person:100";
 		CREATE person:⟨100⟩ SET test = 'Two';
 		CREATE person:`100`;
 		SELECT * FROM person;
 	"#;
-	let dbs = Datastore::new("memory").await?;
-	let ses = Session::for_kv().with_ns("test").with_db("test");
-	let res = &mut dbs.execute(&sql, &ses, None, false).await?;
+	let dbs = new_ds().await?;
+	let ses = Session::owner().with_ns("test").with_db("test");
+	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 7);
 	//
 	let tmp = res.remove(0).result?;
@@ -94,9 +95,9 @@ async fn complex_strings() -> Result<(), Error> {
 		RETURN "String with some \"escaped double quoted\" characters";
 		RETURN "String with some 'single' and \"double\" quoted characters";
 	"#;
-	let dbs = Datastore::new("memory").await?;
-	let ses = Session::for_kv().with_ns("test").with_db("test");
-	let res = &mut dbs.execute(&sql, &ses, None, false).await?;
+	let dbs = new_ds().await?;
+	let ses = Session::owner().with_ns("test").with_db("test");
+	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 5);
 	//
 	let tmp = res.remove(0).result?;

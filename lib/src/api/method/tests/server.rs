@@ -1,16 +1,12 @@
-use super::types::Root;
 use super::types::User;
 use crate::api::conn::DbResponse;
 use crate::api::conn::Method;
 use crate::api::conn::Route;
-use crate::api::opt::from_value;
 use crate::api::Response as QueryResponse;
 use crate::sql::to_value;
-use crate::sql::Array;
 use crate::sql::Value;
 use flume::Receiver;
 use futures::StreamExt;
-use std::mem;
 
 pub(super) fn mock(route_rx: Receiver<Option<Route>>) {
 	tokio::spawn(async move {
@@ -48,12 +44,7 @@ pub(super) fn mock(route_rx: Receiver<Option<Route>>) {
 					_ => unreachable!(),
 				},
 				Method::Signup | Method::Signin => match &mut params[..] {
-					[credentials] => match from_value(mem::take(credentials)) {
-						Ok(Root {
-							..
-						}) => Ok(DbResponse::Other(Value::None)),
-						_ => Ok(DbResponse::Other("jwt".to_owned().into())),
-					},
+					[_] => Ok(DbResponse::Other("jwt".to_owned().into())),
 					_ => unreachable!(),
 				},
 				Method::Set => match &params[..] {
@@ -61,7 +52,7 @@ pub(super) fn mock(route_rx: Receiver<Option<Route>>) {
 					_ => unreachable!(),
 				},
 				Method::Query => match param.query {
-					Some(_) => Ok(DbResponse::Query(QueryResponse(Default::default()))),
+					Some(_) => Ok(DbResponse::Query(QueryResponse::new())),
 					_ => unreachable!(),
 				},
 				Method::Create => match &params[..] {
@@ -72,7 +63,7 @@ pub(super) fn mock(route_rx: Receiver<Option<Route>>) {
 				Method::Select | Method::Delete => match &params[..] {
 					[Value::Thing(..)] => Ok(DbResponse::Other(to_value(User::default()).unwrap())),
 					[Value::Table(..) | Value::Array(..) | Value::Range(..)] => {
-						Ok(DbResponse::Other(Value::Array(Array(Vec::new()))))
+						Ok(DbResponse::Other(Value::Array(Default::default())))
 					}
 					_ => unreachable!(),
 				},
@@ -82,7 +73,16 @@ pub(super) fn mock(route_rx: Receiver<Option<Route>>) {
 					}
 					[Value::Table(..) | Value::Array(..) | Value::Range(..)]
 					| [Value::Table(..) | Value::Array(..) | Value::Range(..), _] => {
-						Ok(DbResponse::Other(Value::Array(Array(Vec::new()))))
+						Ok(DbResponse::Other(Value::Array(Default::default())))
+					}
+					_ => unreachable!(),
+				},
+				Method::Insert => match &params[..] {
+					[Value::Table(..), Value::Array(..)] => {
+						Ok(DbResponse::Other(Value::Array(Default::default())))
+					}
+					[Value::Table(..), _] => {
+						Ok(DbResponse::Other(to_value(User::default()).unwrap()))
 					}
 					_ => unreachable!(),
 				},

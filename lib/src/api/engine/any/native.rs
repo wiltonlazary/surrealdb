@@ -9,18 +9,20 @@ use crate::api::engine::any::Any;
 #[cfg(feature = "protocol-http")]
 use crate::api::engine::remote::http;
 use crate::api::err::Error;
-use crate::api::opt::Endpoint;
 #[cfg(any(feature = "native-tls", feature = "rustls"))]
 #[cfg(feature = "protocol-http")]
 use crate::api::opt::Tls;
+use crate::api::opt::{Endpoint, EndpointKind};
 use crate::api::DbResponse;
 #[allow(unused_imports)] // used by the DB engines
 use crate::api::ExtraFeatures;
+use crate::api::OnceLockExt;
 use crate::api::Result;
 use crate::api::Surreal;
+#[allow(unused_imports)]
 use crate::error::Db as DbError;
+use crate::opt::WaitFor;
 use flume::Receiver;
-use once_cell::sync::OnceCell;
 #[cfg(feature = "protocol-http")]
 use reqwest::ClientBuilder;
 use std::collections::HashSet;
@@ -29,6 +31,8 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use tokio::sync::watch;
 #[cfg(feature = "protocol-ws")]
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 #[cfg(feature = "protocol-ws")]
@@ -59,11 +63,12 @@ impl Connection for Any {
 			let (conn_tx, conn_rx) = flume::bounded::<Result<()>>(1);
 			let mut features = HashSet::new();
 
-			match address.endpoint.scheme() {
-				"fdb" => {
+			match EndpointKind::from(address.url.scheme()) {
+				EndpointKind::FoundationDb => {
 					#[cfg(feature = "kv-fdb")]
 					{
 						features.insert(ExtraFeatures::Backup);
+						features.insert(ExtraFeatures::LiveQueries);
 						engine::local::native::router(address, conn_tx, route_rx);
 						conn_rx.into_recv_async().await??
 					}
@@ -74,10 +79,11 @@ impl Connection for Any {
 					);
 				}
 
-				"mem" => {
+				EndpointKind::Memory => {
 					#[cfg(feature = "kv-mem")]
 					{
 						features.insert(ExtraFeatures::Backup);
+						features.insert(ExtraFeatures::LiveQueries);
 						engine::local::native::router(address, conn_tx, route_rx);
 						conn_rx.into_recv_async().await??
 					}
@@ -88,10 +94,11 @@ impl Connection for Any {
 					);
 				}
 
-				"file" | "rocksdb" => {
+				EndpointKind::File | EndpointKind::RocksDb => {
 					#[cfg(feature = "kv-rocksdb")]
 					{
 						features.insert(ExtraFeatures::Backup);
+						features.insert(ExtraFeatures::LiveQueries);
 						engine::local::native::router(address, conn_tx, route_rx);
 						conn_rx.into_recv_async().await??
 					}
@@ -103,10 +110,27 @@ impl Connection for Any {
 					.into());
 				}
 
-				"tikv" => {
+				EndpointKind::SpeeDb => {
+					#[cfg(feature = "kv-speedb")]
+					{
+						features.insert(ExtraFeatures::Backup);
+						features.insert(ExtraFeatures::LiveQueries);
+						engine::local::native::router(address, conn_tx, route_rx);
+						conn_rx.into_recv_async().await??
+					}
+
+					#[cfg(not(feature = "kv-speedb"))]
+					return Err(DbError::Ds(
+						"Cannot connect to the `speedb` storage engine as it is not enabled in this build of SurrealDB".to_owned(),
+					)
+					.into());
+				}
+
+				EndpointKind::TiKv => {
 					#[cfg(feature = "kv-tikv")]
 					{
 						features.insert(ExtraFeatures::Backup);
+						features.insert(ExtraFeatures::LiveQueries);
 						engine::local::native::router(address, conn_tx, route_rx);
 						conn_rx.into_recv_async().await??
 					}
@@ -117,16 +141,31 @@ impl Connection for Any {
 					);
 				}
 
-				"http" | "https" => {
+				EndpointKind::SurrealKV => {
+					#[cfg(feature = "kv-surrealkv")]
+					{
+						features.insert(ExtraFeatures::Backup);
+						features.insert(ExtraFeatures::LiveQueries);
+						engine::local::native::router(address, conn_tx, route_rx);
+						conn_rx.into_recv_async().await??
+					}
+
+					#[cfg(not(feature = "kv-surrealkv"))]
+					return Err(DbError::Ds(
+						"Cannot connect to the `surrealkv` storage engine as it is not enabled in this build of SurrealDB".to_owned(),
+					)
+					.into());
+				}
+
+				EndpointKind::Http | EndpointKind::Https => {
 					#[cfg(feature = "protocol-http")]
 					{
-						features.insert(ExtraFeatures::Auth);
 						features.insert(ExtraFeatures::Backup);
 						let headers = http::default_headers();
 						#[allow(unused_mut)]
 						let mut builder = ClientBuilder::new().default_headers(headers);
 						#[cfg(any(feature = "native-tls", feature = "rustls"))]
-						if let Some(tls) = address.tls_config {
+						if let Some(tls) = address.config.tls_config {
 							builder = match tls {
 								#[cfg(feature = "native-tls")]
 								Tls::Native(config) => builder.use_preconfigured_tls(config),
@@ -135,7 +174,7 @@ impl Connection for Any {
 							};
 						}
 						let client = builder.build()?;
-						let base_url = address.endpoint;
+						let base_url = address.url;
 						engine::remote::http::health(
 							client.get(base_url.join(Method::Health.as_str())?),
 						)
@@ -150,32 +189,31 @@ impl Connection for Any {
 					.into());
 				}
 
-				"ws" | "wss" => {
+				EndpointKind::Ws | EndpointKind::Wss => {
 					#[cfg(feature = "protocol-ws")]
 					{
-						features.insert(ExtraFeatures::Auth);
-						let url = address.endpoint.join(engine::remote::ws::PATH)?;
+						features.insert(ExtraFeatures::LiveQueries);
+						let mut endpoint = address;
+						endpoint.url = endpoint.url.join(engine::remote::ws::PATH)?;
 						#[cfg(any(feature = "native-tls", feature = "rustls"))]
-						let maybe_connector = address.tls_config.map(Connector::from);
+						let maybe_connector = endpoint.config.tls_config.clone().map(Connector::from);
 						#[cfg(not(any(feature = "native-tls", feature = "rustls")))]
 						let maybe_connector = None;
+
 						let config = WebSocketConfig {
-							max_send_queue: match capacity {
-								0 => None,
-								capacity => Some(capacity),
-							},
 							max_message_size: Some(engine::remote::ws::native::MAX_MESSAGE_SIZE),
 							max_frame_size: Some(engine::remote::ws::native::MAX_FRAME_SIZE),
-							accept_unmasked_frames: false,
+							max_write_buffer_size: engine::remote::ws::native::MAX_MESSAGE_SIZE,
+							..Default::default()
 						};
 						let socket = engine::remote::ws::native::connect(
-							&url,
+							&endpoint,
 							Some(config),
 							maybe_connector.clone(),
 						)
 						.await?;
 						engine::remote::ws::native::router(
-							url,
+							endpoint,
 							maybe_connector,
 							capacity,
 							config,
@@ -190,26 +228,24 @@ impl Connection for Any {
 					)
 					.into());
 				}
-
-				scheme => {
-					return Err(Error::Scheme(scheme.to_owned()).into());
-				}
+				EndpointKind::Unsupported(v) => return Err(Error::Scheme(v).into()),
 			}
 
 			Ok(Surreal {
-				router: OnceCell::with_value(Arc::new(Router {
+				router: Arc::new(OnceLock::with_value(Router {
 					features,
-					conn: PhantomData,
 					sender: route_tx,
 					last_id: AtomicI64::new(0),
 				})),
+				waiter: Arc::new(watch::channel(Some(WaitFor::Connection))),
+				engine: PhantomData,
 			})
 		})
 	}
 
 	fn send<'r>(
 		&'r mut self,
-		router: &'r Router<Self>,
+		router: &'r Router,
 		param: Param,
 	) -> Pin<Box<dyn Future<Output = Result<Receiver<Result<DbResponse>>>> + Send + Sync + 'r>> {
 		Box::pin(async move {

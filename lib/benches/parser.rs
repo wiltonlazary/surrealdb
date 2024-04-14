@@ -1,4 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use pprof::criterion::{Output, PProfProfiler};
 
 macro_rules! parser {
 	($c: expr, $name: ident, $parser: path, $text: expr) => {
@@ -58,8 +59,13 @@ fn bench_parser(c: &mut Criterion) {
 			&(1..=100).map(|n| format!("'{n}': {n}")).collect::<Vec<_>>().join(", ")
 		)
 	);
+	parser!(c, full_test, surrealdb::sql::parse, include_str!("../../core/test.surql"));
 	c.finish();
 }
 
-criterion_group!(benches, bench_parser);
+criterion_group!(
+	name = benches;
+	config = Criterion::default().with_profiler(PProfProfiler::new(1000, Output::Flamegraph(None)));
+	targets = bench_parser
+);
 criterion_main!(benches);

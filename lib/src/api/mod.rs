@@ -2,36 +2,43 @@
 
 pub mod engine;
 pub mod err;
+#[cfg(feature = "protocol-http")]
+pub mod headers;
 pub mod method;
 pub mod opt;
 
 mod conn;
 
 pub use method::query::Response;
+use semver::Version;
+use tokio::sync::watch;
 
 use crate::api::conn::DbResponse;
 use crate::api::conn::Router;
 use crate::api::err::Error;
 use crate::api::opt::Endpoint;
-use once_cell::sync::OnceCell;
 use semver::BuildMetadata;
 use semver::VersionReq;
+use std::fmt;
 use std::fmt::Debug;
 use std::future::Future;
 use std::future::IntoFuture;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::spawn;
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen_futures::spawn_local as spawn;
+use std::sync::OnceLock;
+
+use self::opt::EndpointKind;
+use self::opt::WaitFor;
 
 /// A specialized `Result` type
 pub type Result<T> = std::result::Result<T, crate::Error>;
 
-const SUPPORTED_VERSIONS: (&str, &str) = (">=1.0.0-beta.8, <2.0.0", "20221030.c12a1cc");
-const LOG: &str = "surrealdb::api";
+// Channel for waiters
+type Waiter = (watch::Sender<Option<WaitFor>>, watch::Receiver<Option<WaitFor>>);
+
+const SUPPORTED_VERSIONS: (&str, &str) = (">=1.0.0, <2.0.0", "20230701.55918b7c");
+const REVISION_SUPPORTED_SERVER_VERSION: Version = Version::new(1, 2, 0);
 
 /// Connection trait implemented by supported engines
 pub trait Connection: conn::Connection {}
@@ -39,15 +46,17 @@ pub trait Connection: conn::Connection {}
 /// The future returned when creating a new SurrealDB instance
 #[derive(Debug)]
 #[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct Connect<'r, C: Connection, Response> {
-	router: Option<&'r OnceCell<Arc<Router<C>>>>,
+pub struct Connect<C: Connection, Response> {
+	router: Arc<OnceLock<Router>>,
+	engine: PhantomData<C>,
 	address: Result<Endpoint>,
 	capacity: usize,
 	client: PhantomData<C>,
+	waiter: Arc<Waiter>,
 	response_type: PhantomData<Response>,
 }
 
-impl<C, R> Connect<'_, C, R>
+impl<C, R> Connect<C, R>
 where
 	C: Connection,
 {
@@ -83,44 +92,69 @@ where
 	}
 }
 
-impl<'r, Client> IntoFuture for Connect<'r, Client, Surreal<Client>>
+impl<Client> IntoFuture for Connect<Client, Surreal<Client>>
 where
 	Client: Connection,
 {
 	type Output = Result<Surreal<Client>>;
-	type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + Sync + 'r>>;
+	type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + Sync>>;
 
 	fn into_future(self) -> Self::IntoFuture {
 		Box::pin(async move {
-			let client = Client::connect(self.address?, self.capacity).await?;
-			client.check_server_version();
+			let mut endpoint = self.address?;
+			let endpoint_kind = EndpointKind::from(endpoint.url.scheme());
+			let mut client = Client::connect(endpoint.clone(), self.capacity).await?;
+			if endpoint_kind.is_remote() {
+				let mut version = client.version().await?;
+				// we would like to be able to connect to pre-releases too
+				version.pre = Default::default();
+				client.check_server_version(&version).await?;
+				if version >= REVISION_SUPPORTED_SERVER_VERSION && endpoint_kind.is_ws() {
+					// Switch to revision based serialisation
+					endpoint.supports_revision = true;
+					client = Client::connect(endpoint, self.capacity).await?;
+				}
+			}
+			// Both ends of the channel are still alive at this point
+			client.waiter.0.send(Some(WaitFor::Connection)).ok();
 			Ok(client)
 		})
 	}
 }
 
-impl<'r, Client> IntoFuture for Connect<'r, Client, ()>
+impl<Client> IntoFuture for Connect<Client, ()>
 where
 	Client: Connection,
 {
 	type Output = Result<()>;
-	type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + Sync + 'r>>;
+	type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + Sync>>;
 
 	fn into_future(self) -> Self::IntoFuture {
 		Box::pin(async move {
-			match self.router {
-				Some(router) => {
-					let option =
-						Client::connect(self.address?, self.capacity).await?.router.into_inner();
-					match option {
-						Some(client) => {
-							let _res = router.set(client);
-						}
-						None => unreachable!(),
-					}
-				}
-				None => unreachable!(),
+			// Avoid establishing another connection if already connected
+			if self.router.get().is_some() {
+				return Err(Error::AlreadyConnected.into());
 			}
+			let mut endpoint = self.address?;
+			let endpoint_kind = EndpointKind::from(endpoint.url.scheme());
+			let mut client = Client::connect(endpoint.clone(), self.capacity).await?;
+			if endpoint_kind.is_remote() {
+				let mut version = client.version().await?;
+				// we would like to be able to connect to pre-releases too
+				version.pre = Default::default();
+				client.check_server_version(&version).await?;
+				if version >= REVISION_SUPPORTED_SERVER_VERSION && endpoint_kind.is_ws() {
+					// Switch to revision based serialisation
+					endpoint.supports_revision = true;
+					client = Client::connect(endpoint, self.capacity).await?;
+				}
+			}
+			let cell =
+				Arc::into_inner(client.router).expect("new connection to have no references");
+			let router = cell.into_inner().expect("router to be set");
+			self.router.set(router).map_err(|_| Error::AlreadyConnected)?;
+			// Both ends of the channel are still alive at this point
+			self.waiter.0.send(Some(WaitFor::Connection)).ok();
 			Ok(())
 		})
 	}
@@ -128,42 +162,41 @@ where
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(crate) enum ExtraFeatures {
-	Auth,
 	Backup,
+	LiveQueries,
 }
 
 /// A database client instance for embedded or remote databases
-#[derive(Debug)]
 pub struct Surreal<C: Connection> {
-	router: OnceCell<Arc<Router<C>>>,
+	router: Arc<OnceLock<Router>>,
+	waiter: Arc<Waiter>,
+	engine: PhantomData<C>,
 }
 
 impl<C> Surreal<C>
 where
 	C: Connection,
 {
-	fn check_server_version(&self) {
-		let conn = self.clone();
-		spawn(async move {
-			let (versions, build_meta) = SUPPORTED_VERSIONS;
-			// invalid version requirements should be caught during development
-			let req = VersionReq::parse(versions).expect("valid supported versions");
-			let build_meta =
-				BuildMetadata::new(build_meta).expect("valid supported build metadata");
-			match conn.version().await {
-				Ok(version) => {
-					let server_build = &version.build;
-					if !req.matches(&version) {
-						warn!(target: LOG, "server version `{version}` does not match the range supported by the client `{versions}`");
-					} else if !server_build.is_empty() && server_build < &build_meta {
-						warn!(target: LOG, "server build `{server_build}` is older than the minimum supported build `{build_meta}`");
-					}
-				}
-				Err(error) => {
-					trace!(target: LOG, "failed to lookup the server version; {error:?}");
-				}
+	async fn check_server_version(&self, version: &Version) -> Result<()> {
+		let (versions, build_meta) = SUPPORTED_VERSIONS;
+		// invalid version requirements should be caught during development
+		let req = VersionReq::parse(versions).expect("valid supported versions");
+		let build_meta = BuildMetadata::new(build_meta).expect("valid supported build metadata");
+		let server_build = &version.build;
+		if !req.matches(version) {
+			return Err(Error::VersionMismatch {
+				server_version: version.clone(),
+				supported_versions: versions.to_owned(),
 			}
-		});
+			.into());
+		} else if !server_build.is_empty() && server_build < &build_meta {
+			return Err(Error::BuildMetadataMismatch {
+				server_metadata: server_build.clone(),
+				supported_metadata: build_meta,
+			}
+			.into());
+		}
+		Ok(())
 	}
 }
 
@@ -174,22 +207,38 @@ where
 	fn clone(&self) -> Self {
 		Self {
 			router: self.router.clone(),
+			waiter: self.waiter.clone(),
+			engine: self.engine,
 		}
 	}
 }
 
-trait ExtractRouter<C>
+impl<C> Debug for Surreal<C>
 where
 	C: Connection,
 {
-	fn extract(&self) -> Result<&Router<C>>;
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("Surreal")
+			.field("router", &self.router)
+			.field("engine", &self.engine)
+			.finish()
+	}
 }
 
-impl<C> ExtractRouter<C> for OnceCell<Arc<Router<C>>>
-where
-	C: Connection,
-{
-	fn extract(&self) -> Result<&Router<C>> {
+trait OnceLockExt {
+	fn with_value(value: Router) -> OnceLock<Router> {
+		let cell = OnceLock::new();
+		match cell.set(value) {
+			Ok(()) => cell,
+			Err(_) => unreachable!("don't have exclusive access to `cell`"),
+		}
+	}
+
+	fn extract(&self) -> Result<&Router>;
+}
+
+impl OnceLockExt for OnceLock<Router> {
+	fn extract(&self) -> Result<&Router> {
 		let router = self.get().ok_or(Error::ConnectionUninitialised)?;
 		Ok(router)
 	}

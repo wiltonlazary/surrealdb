@@ -1,5 +1,6 @@
 //! Methods to use when interacting with a SurrealDB instance
 
+pub(crate) mod live;
 pub(crate) mod query;
 
 mod authenticate;
@@ -12,9 +13,8 @@ mod delete;
 mod export;
 mod health;
 mod import;
+mod insert;
 mod invalidate;
-mod kill;
-mod live;
 mod merge;
 mod patch;
 mod select;
@@ -23,6 +23,7 @@ mod signin;
 mod signup;
 mod unset;
 mod update;
+mod use_db;
 mod use_ns;
 mod version;
 
@@ -41,25 +42,26 @@ pub use commit::Commit;
 pub use content::Content;
 pub use create::Create;
 pub use delete::Delete;
+pub use export::Backup;
 pub use export::Export;
 pub use health::Health;
 pub use import::Import;
+pub use insert::Insert;
 pub use invalidate::Invalidate;
-#[doc(hidden)] // Not supported yet
-pub use kill::Kill;
-#[doc(hidden)] // Not supported yet
-pub use live::Live;
+pub use live::Stream;
 pub use merge::Merge;
 pub use patch::Patch;
 pub use query::Query;
+pub use query::QueryStream;
 pub use select::Select;
 pub use set::Set;
 pub use signin::Signin;
 pub use signup::Signup;
+use tokio::sync::watch;
 pub use unset::Unset;
 pub use update::Update;
+pub use use_db::UseDb;
 pub use use_ns::UseNs;
-pub use use_ns::UseNsDb;
 pub use version::Version;
 
 use crate::api::conn::Method;
@@ -70,14 +72,37 @@ use crate::api::opt::auth::Jwt;
 use crate::api::opt::IntoEndpoint;
 use crate::api::Connect;
 use crate::api::Connection;
-use crate::api::ExtractRouter;
+use crate::api::OnceLockExt;
 use crate::api::Surreal;
+use crate::opt::IntoExportDestination;
+use crate::opt::WaitFor;
 use crate::sql::to_value;
-use crate::sql::Uuid;
-use once_cell::sync::OnceCell;
+use crate::sql::Value;
 use serde::Serialize;
+use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+/// Query statistics
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub struct Stats {
+	/// The time taken to execute the query
+	pub execution_time: Option<Duration>,
+}
+
+/// Machine learning model marker type for import and export types
+pub struct Model;
+
+/// Live query marker type
+pub struct Live;
+
+/// Responses returned with statistics
+#[derive(Debug)]
+pub struct WithStats<T>(T);
 
 impl Method {
 	#[allow(dead_code)] // used by `ws` and `http`
@@ -90,6 +115,7 @@ impl Method {
 			Method::Health => "health",
 			Method::Import => "import",
 			Method::Invalidate => "invalidate",
+			Method::Insert => "insert",
 			Method::Kill => "kill",
 			Method::Live => "live",
 			Method::Merge => "merge",
@@ -111,31 +137,32 @@ impl<C> Surreal<C>
 where
 	C: Connection,
 {
-	/// Creates a new static instance of the client
+	/// Initialises a new unconnected instance of the client
 	///
-	/// The static singleton ensures that a single database instance is available across very large
-	/// or complicated applications. With the singleton, only one connection to the database is
-	/// instantiated, and the database connection does not have to be shared across components
-	/// or controllers.
+	/// This makes it easy to create a static singleton of the client. The static singleton
+	/// pattern in the example below ensures that a single database instance is available
+	/// across very large or complicated applications. With the singleton, only one connection
+	/// to the database is instantiated, and the database connection does not have to be shared
+	/// across components or controllers.
 	///
 	/// # Examples
 	///
 	/// Using a static, compile-time scheme
 	///
 	/// ```no_run
+	/// use once_cell::sync::Lazy;
 	/// use serde::{Serialize, Deserialize};
-	/// use std::borrow::Cow;
 	/// use surrealdb::Surreal;
 	/// use surrealdb::opt::auth::Root;
 	/// use surrealdb::engine::remote::ws::Ws;
 	/// use surrealdb::engine::remote::ws::Client;
 	///
 	/// // Creates a new static instance of the client
-	/// static DB: Surreal<Client> = Surreal::init();
+	/// static DB: Lazy<Surreal<Client>> = Lazy::new(Surreal::init);
 	///
 	/// #[derive(Serialize, Deserialize)]
 	/// struct Person {
-	///     name: Cow<'static, str>,
+	///     name: String,
 	/// }
 	///
 	/// #[tokio::main]
@@ -165,18 +192,18 @@ where
 	/// Using a dynamic, run-time scheme
 	///
 	/// ```no_run
+	/// use once_cell::sync::Lazy;
 	/// use serde::{Serialize, Deserialize};
-	/// use std::borrow::Cow;
 	/// use surrealdb::Surreal;
 	/// use surrealdb::engine::any::Any;
 	/// use surrealdb::opt::auth::Root;
 	///
 	/// // Creates a new static instance of the client
-	/// static DB: Surreal<Any> = Surreal::init();
+	/// static DB: Lazy<Surreal<Any>> = Lazy::new(Surreal::init);
 	///
 	/// #[derive(Serialize, Deserialize)]
 	/// struct Person {
-	///     name: Cow<'static, str>,
+	///     name: String,
 	/// }
 	///
 	/// #[tokio::main]
@@ -202,9 +229,11 @@ where
 	///     Ok(())
 	/// }
 	/// ```
-	pub const fn init() -> Self {
+	pub fn init() -> Self {
 		Self {
-			router: OnceCell::new(),
+			router: Arc::new(OnceLock::new()),
+			waiter: Arc::new(watch::channel(None)),
+			engine: PhantomData,
 		}
 	}
 
@@ -227,12 +256,14 @@ where
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn new<P>(address: impl IntoEndpoint<P, Client = C>) -> Connect<'static, C, Self> {
+	pub fn new<P>(address: impl IntoEndpoint<P, Client = C>) -> Connect<C, Self> {
 		Connect {
-			router: None,
+			router: Arc::new(OnceLock::new()),
+			engine: PhantomData,
 			address: address.into_endpoint(),
 			capacity: 0,
 			client: PhantomData,
+			waiter: Arc::new(watch::channel(None)),
 			response_type: PhantomData,
 		}
 	}
@@ -252,14 +283,34 @@ where
 	/// # #[tokio::main]
 	/// # async fn main() -> surrealdb::Result<()> {
 	/// # let db = surrealdb::engine::any::connect("mem://").await?;
-	/// db.use_ns("namespace").use_db("database").await?;
+	/// db.use_ns("namespace").await?;
 	/// # Ok(())
 	/// # }
 	/// ```
 	pub fn use_ns(&self, ns: impl Into<String>) -> UseNs<C> {
 		UseNs {
-			router: self.router.extract(),
+			client: Cow::Borrowed(self),
 			ns: ns.into(),
+		}
+	}
+
+	/// Switch to a specific database
+	///
+	/// # Examples
+	///
+	/// ```no_run
+	/// # #[tokio::main]
+	/// # async fn main() -> surrealdb::Result<()> {
+	/// # let db = surrealdb::engine::any::connect("mem://").await?;
+	/// db.use_db("database").await?;
+	/// # Ok(())
+	/// # }
+	/// ```
+	pub fn use_db(&self, db: impl Into<String>) -> UseDb<C> {
+		UseDb {
+			client: Cow::Borrowed(self),
+			ns: Value::None,
+			db: db.into(),
 		}
 	}
 
@@ -271,9 +322,9 @@ where
 	/// use serde::Serialize;
 	///
 	/// #[derive(Serialize)]
-	/// struct Name<'a> {
-	///     first: &'a str,
-	///     last: &'a str,
+	/// struct Name {
+	///     first: String,
+	///     last: String,
 	/// }
 	///
 	/// # #[tokio::main]
@@ -282,8 +333,8 @@ where
 	/// #
 	/// // Assign the variable on the connection
 	/// db.set("name", Name {
-	///     first: "Tobie",
-	///     last: "Morgan Hitchcock",
+	///     first: "Tobie".into(),
+	///     last: "Morgan Hitchcock".into(),
 	/// }).await?;
 	///
 	/// // Use the variable in a subsequent query
@@ -297,7 +348,7 @@ where
 	/// ```
 	pub fn set(&self, key: impl Into<String>, value: impl Serialize) -> Set<C> {
 		Set {
-			router: self.router.extract(),
+			client: Cow::Borrowed(self),
 			key: key.into(),
 			value: to_value(value).map_err(Into::into),
 		}
@@ -311,9 +362,9 @@ where
 	/// use serde::Serialize;
 	///
 	/// #[derive(Serialize)]
-	/// struct Name<'a> {
-	///     first: &'a str,
-	///     last: &'a str,
+	/// struct Name {
+	///     first: String,
+	///     last: String,
 	/// }
 	///
 	/// # #[tokio::main]
@@ -322,8 +373,8 @@ where
 	/// #
 	/// // Assign the variable on the connection
 	/// db.set("name", Name {
-	///     first: "Tobie",
-	///     last: "Morgan Hitchcock",
+	///     first: "Tobie".into(),
+	///     last: "Morgan Hitchcock".into(),
 	/// }).await?;
 	///
 	/// // Use the variable in a subsequent query
@@ -337,16 +388,12 @@ where
 	/// ```
 	pub fn unset(&self, key: impl Into<String>) -> Unset<C> {
 		Unset {
-			router: self.router.extract(),
+			client: Cow::Borrowed(self),
 			key: key.into(),
 		}
 	}
 
 	/// Signs up a user to a specific authentication scope
-	///
-	/// # Support
-	///
-	/// Currently only supported by the WS and HTTP protocols.
 	///
 	/// # Examples
 	///
@@ -357,9 +404,9 @@ where
 	/// use surrealdb::opt::auth::Scope;
 	///
 	/// #[derive(Debug, Serialize)]
-	/// struct AuthParams<'a> {
-	///     email: &'a str,
-	///     password: &'a str,
+	/// struct AuthParams {
+	///     email: String,
+	///     password: String,
 	/// }
 	///
 	/// # #[tokio::main]
@@ -390,8 +437,8 @@ where
 	///     database: "database",
 	///     scope: "user_scope",
 	///     params: AuthParams {
-	///         email: "john.doe@example.com",
-	///         password: "password123",
+	///         email: "john.doe@example.com".into(),
+	///         password: "password123".into(),
 	///     },
 	/// }).await?;
 	/// #
@@ -400,17 +447,13 @@ where
 	/// ```
 	pub fn signup<R>(&self, credentials: impl Credentials<auth::Signup, R>) -> Signup<C, R> {
 		Signup {
-			router: self.router.extract(),
+			client: Cow::Borrowed(self),
 			credentials: to_value(credentials).map_err(Into::into),
 			response_type: PhantomData,
 		}
 	}
 
 	/// Signs this connection in to a specific authentication scope
-	///
-	/// # Support
-	///
-	/// Currently only supported by the WS and HTTP protocols.
 	///
 	/// # Examples
 	///
@@ -435,8 +478,8 @@ where
 	/// // Select the namespace/database to use
 	/// db.use_ns("namespace").use_db("database").await?;
 	///
-	/// // Define the login
-	/// let sql = "DEFINE LOGIN johndoe ON NAMESPACE PASSWORD 'password123'";
+	/// // Define the user
+	/// let sql = "DEFINE USER johndoe ON NAMESPACE PASSWORD 'password123'";
 	/// db.query(sql).await?.check()?;
 	///
 	/// // Sign a user in
@@ -471,8 +514,8 @@ where
 	/// // Select the namespace/database to use
 	/// db.use_ns("namespace").use_db("database").await?;
 	///
-	/// // Define the login
-	/// let sql = "DEFINE LOGIN johndoe ON DATABASE PASSWORD 'password123'";
+	/// // Define the user
+	/// let sql = "DEFINE USER johndoe ON DATABASE PASSWORD 'password123'";
 	/// db.query(sql).await?.check()?;
 	///
 	/// // Sign a user in
@@ -495,9 +538,9 @@ where
 	/// use surrealdb::opt::auth::Scope;
 	///
 	/// #[derive(Debug, Serialize)]
-	/// struct AuthParams<'a> {
-	///     email: &'a str,
-	///     password: &'a str,
+	/// struct AuthParams {
+	///     email: String,
+	///     password: String,
 	/// }
 	///
 	/// # #[tokio::main]
@@ -513,8 +556,8 @@ where
 	///     database: "database",
 	///     scope: "user_scope",
 	///     params: AuthParams {
-	///         email: "john.doe@example.com",
-	///         password: "password123",
+	///         email: "john.doe@example.com".into(),
+	///         password: "password123".into(),
 	///     },
 	/// }).await?;
 	/// #
@@ -523,17 +566,13 @@ where
 	/// ```
 	pub fn signin<R>(&self, credentials: impl Credentials<auth::Signin, R>) -> Signin<C, R> {
 		Signin {
-			router: self.router.extract(),
+			client: Cow::Borrowed(self),
 			credentials: to_value(credentials).map_err(Into::into),
 			response_type: PhantomData,
 		}
 	}
 
 	/// Invalidates the authentication for the current connection
-	///
-	/// # Support
-	///
-	/// Currently only supported by the WS and HTTP protocols.
 	///
 	/// # Examples
 	///
@@ -547,15 +586,11 @@ where
 	/// ```
 	pub fn invalidate(&self) -> Invalidate<C> {
 		Invalidate {
-			router: self.router.extract(),
+			client: Cow::Borrowed(self),
 		}
 	}
 
 	/// Authenticates the current connection with a JWT token
-	///
-	/// # Support
-	///
-	/// Currently only supported by the WS and HTTP protocols.
 	///
 	/// # Examples
 	///
@@ -570,7 +605,7 @@ where
 	/// ```
 	pub fn authenticate(&self, token: impl Into<Jwt>) -> Authenticate<C> {
 		Authenticate {
-			router: self.router.extract(),
+			client: Cow::Borrowed(self),
 			token: token.into(),
 		}
 	}
@@ -603,15 +638,35 @@ where
 	///
 	/// // Get all of the results from the second query
 	/// let people: Vec<Person> = result.take(1)?;
+	///
+	/// #[derive(serde::Deserialize)]
+	/// struct Country {
+	///     name: String
+	/// }
+	///
+	/// // The .take() method can be used for error handling
+	///
+	/// // If the table has no defined schema, this query will
+	/// // create a `country` on the SurrealDB side, but...
+	/// let mut result = db
+	///     .query("CREATE country")
+	///     .await?;
+	///
+	/// // It won't deserialize into a Country struct
+	/// if let Err(e) = result.take::<Option<Country>>(0) {
+	///     println!("Failed to make a country: {e:#?}");
+	///     assert!(e.to_string().contains("missing field `name`"));
+	/// }
 	/// #
 	/// # Ok(())
 	/// # }
 	/// ```
 	pub fn query(&self, query: impl opt::IntoQuery) -> Query<C> {
 		Query {
-			router: self.router.extract(),
+			client: Cow::Borrowed(self),
 			query: vec![query.into_query()],
 			bindings: Ok(Default::default()),
+			register_live_queries: true,
 		}
 	}
 
@@ -620,6 +675,8 @@ where
 	/// # Examples
 	///
 	/// ```no_run
+	/// # use futures::StreamExt;
+	/// # use surrealdb::opt::Resource;
 	/// # #[derive(serde::Deserialize)]
 	/// # struct Person;
 	/// #
@@ -633,21 +690,32 @@ where
 	/// // Select all records from a table
 	/// let people: Vec<Person> = db.select("person").await?;
 	///
+	/// // Select a range of records from a table
+	/// let people: Vec<Person> = db.select("person").range("jane".."john").await?;
+	///
 	/// // Select a specific record from a table
 	/// let person: Option<Person> = db.select(("person", "h5wxrf2ewk8xjxosxtyc")).await?;
 	///
-	/// // You can skip an unnecessary option if you know the record already exists
-	/// let person: Option<Person> = db.select(("person", "h5wxrf2ewk8xjxosxtyc")).await?;
+	/// // To listen for updates as they happen on a record, a range of records
+	/// // or entire table use a live query. This is done by simply calling `.live()`
+	/// // after this method. That gives you a stream of notifications you can listen on.
+	/// # let resource = Resource::from("person");
+	/// let mut stream = db.select(resource).live().await?;
+	///
+	/// while let Some(notification) = stream.next().await {
+	///     // Use the notification
+	/// }
 	/// #
 	/// # Ok(())
 	/// # }
 	/// ```
 	pub fn select<R>(&self, resource: impl opt::IntoResource<R>) -> Select<C, R> {
 		Select {
-			router: self.router.extract(),
+			client: Cow::Borrowed(self),
 			resource: resource.into_resource(),
 			range: None,
 			response_type: PhantomData,
+			query_type: PhantomData,
 		}
 	}
 
@@ -668,8 +736,8 @@ where
 	/// }
 	///
 	/// #[derive(Serialize)]
-	/// struct User<'a> {
-	///     name: &'a str,
+	/// struct User {
+	///     name: &'static str,
 	///     settings: Settings,
 	/// }
 	///
@@ -699,7 +767,108 @@ where
 	/// ```
 	pub fn create<R>(&self, resource: impl opt::IntoResource<R>) -> Create<C, R> {
 		Create {
-			router: self.router.extract(),
+			client: Cow::Borrowed(self),
+			resource: resource.into_resource(),
+			response_type: PhantomData,
+		}
+	}
+
+	/// Insert a record or records into a table
+	///
+	/// # Examples
+	///
+	/// ```no_run
+	/// use serde::Serialize;
+	/// use surrealdb::sql;
+	///
+	/// # #[derive(serde::Deserialize)]
+	/// # struct Person;
+	/// #
+	/// #[derive(Serialize)]
+	/// struct Settings {
+	///     active: bool,
+	///     marketing: bool,
+	/// }
+	///
+	/// #[derive(Serialize)]
+	/// struct User<'a> {
+	///     name: &'a str,
+	///     settings: Settings,
+	/// }
+	///
+	/// # #[tokio::main]
+	/// # async fn main() -> surrealdb::Result<()> {
+	/// # let db = surrealdb::engine::any::connect("mem://").await?;
+	/// #
+	/// // Select the namespace/database to use
+	/// db.use_ns("namespace").use_db("database").await?;
+	///
+	/// // Insert a record with a specific ID
+	/// let person: Option<Person> = db.insert(("person", "tobie"))
+	///     .content(User {
+	///         name: "Tobie",
+	///         settings: Settings {
+	///             active: true,
+	///             marketing: true,
+	///         },
+	///     })
+	///     .await?;
+	///
+	/// // Insert multiple records into the table
+	/// let people: Vec<Person> = db.insert("person")
+	///     .content(vec![
+	///         User {
+	///             name: "Tobie",
+	///             settings: Settings {
+	///                 active: true,
+	///                 marketing: false,
+	///             },
+	///         },
+	///         User {
+	///             name: "Jaime",
+	///             settings: Settings {
+	///                 active: true,
+	///                 marketing: true,
+	///             },
+	///         },
+	///     ])
+	///     .await?;
+	///
+	/// // Insert multiple records with pre-defined IDs
+	/// #[derive(Serialize)]
+	/// struct UserWithId<'a> {
+	///     id: sql::Thing,
+	///     name: &'a str,
+	///     settings: Settings,
+	/// }
+	///
+	/// let people: Vec<Person> = db.insert("person")
+	///     .content(vec![
+	///         UserWithId {
+	///             id: sql::thing("person:tobie")?,
+	///             name: "Tobie",
+	///             settings: Settings {
+	///                 active: true,
+	///                 marketing: false,
+	///             },
+	///         },
+	///         UserWithId {
+	///             id: sql::thing("person:jaime")?,
+	///             name: "Jaime",
+	///             settings: Settings {
+	///                 active: true,
+	///                 marketing: true,
+	///             },
+	///         },
+	///     ])
+	///     .await?;
+	/// #
+	/// # Ok(())
+	/// # }
+	/// ```
+	pub fn insert<R>(&self, resource: impl opt::IntoResource<R>) -> Insert<C, R> {
+		Insert {
+			client: Cow::Borrowed(self),
 			resource: resource.into_resource(),
 			response_type: PhantomData,
 		}
@@ -724,8 +893,8 @@ where
 	/// }
 	///
 	/// #[derive(Serialize)]
-	/// struct User<'a> {
-	///     name: &'a str,
+	/// struct User {
+	///     name: &'static str,
 	///     settings: Settings,
 	/// }
 	///
@@ -857,7 +1026,7 @@ where
 	/// ```
 	pub fn update<R>(&self, resource: impl opt::IntoResource<R>) -> Update<C, R> {
 		Update {
-			router: self.router.extract(),
+			client: Cow::Borrowed(self),
 			resource: resource.into_resource(),
 			range: None,
 			response_type: PhantomData,
@@ -890,7 +1059,7 @@ where
 	/// ```
 	pub fn delete<R>(&self, resource: impl opt::IntoResource<R>) -> Delete<C, R> {
 		Delete {
-			router: self.router.extract(),
+			client: Cow::Borrowed(self),
 			resource: resource.into_resource(),
 			range: None,
 			response_type: PhantomData,
@@ -911,7 +1080,7 @@ where
 	/// ```
 	pub fn version(&self) -> Version<C> {
 		Version {
-			router: self.router.extract(),
+			client: Cow::Borrowed(self),
 		}
 	}
 
@@ -929,24 +1098,23 @@ where
 	/// ```
 	pub fn health(&self) -> Health<C> {
 		Health {
-			router: self.router.extract(),
+			client: Cow::Borrowed(self),
 		}
 	}
 
-	#[doc(hidden)] // Not supported yet
-	pub fn kill(&self, query_id: Uuid) -> Kill<C> {
-		Kill {
-			router: self.router.extract(),
-			query_id,
-		}
-	}
-
-	#[doc(hidden)] // Not supported yet
-	pub fn live(&self, table_name: impl Into<String>) -> Live<C> {
-		Live {
-			router: self.router.extract(),
-			table_name: table_name.into(),
-		}
+	/// Wait for the selected event to happen before proceeding
+	pub async fn wait_for(&self, event: WaitFor) {
+		let mut rx = self.waiter.0.subscribe();
+		rx.wait_for(|current| match current {
+			// The connection hasn't been initialised yet.
+			None => false,
+			// The connection has been initialised. Only the connection even matches.
+			Some(WaitFor::Connection) => matches!(event, WaitFor::Connection),
+			// The database has been selected. Connection and database events both match.
+			Some(WaitFor::Database) => matches!(event, WaitFor::Connection | WaitFor::Database),
+		})
+		.await
+		.ok();
 	}
 
 	/// Dumps the database contents to a file
@@ -958,23 +1126,38 @@ where
 	/// # Examples
 	///
 	/// ```no_run
+	/// # use futures::StreamExt;
 	/// # #[tokio::main]
 	/// # async fn main() -> surrealdb::Result<()> {
 	/// # let db = surrealdb::engine::any::connect("mem://").await?;
 	/// // Select the namespace/database to use
 	/// db.use_ns("namespace").use_db("database").await?;
 	///
+	/// // Export to a file
 	/// db.export("backup.sql").await?;
+	///
+	/// // Export to a stream of bytes
+	/// let mut backup = db.export(()).await?;
+	/// while let Some(result) = backup.next().await {
+	///     match result {
+	///         Ok(bytes) => {
+	///             // Do something with the bytes received...
+	///         }
+	///         Err(error) => {
+	///             // Handle the export error
+	///         }
+	///     }
+	/// }
 	/// # Ok(())
 	/// # }
 	/// ```
-	pub fn export<P>(&self, file: P) -> Export<C>
-	where
-		P: AsRef<Path>,
-	{
+	pub fn export<R>(&self, target: impl IntoExportDestination<R>) -> Export<C, R> {
 		Export {
-			router: self.router.extract(),
-			file: file.as_ref().to_owned(),
+			client: Cow::Borrowed(self),
+			target: target.into_export_destination(),
+			ml_config: None,
+			response: PhantomData,
+			export_type: PhantomData,
 		}
 	}
 
@@ -1002,8 +1185,10 @@ where
 		P: AsRef<Path>,
 	{
 		Import {
-			router: self.router.extract(),
+			client: Cow::Borrowed(self),
 			file: file.as_ref().to_owned(),
+			ml_config: None,
+			import_type: PhantomData,
 		}
 	}
 }

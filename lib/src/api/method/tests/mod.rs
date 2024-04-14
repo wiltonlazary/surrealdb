@@ -16,6 +16,7 @@ use crate::api::Response as QueryResponse;
 use crate::api::Surreal;
 use crate::sql::statements::BeginStatement;
 use crate::sql::statements::CommitStatement;
+use once_cell::sync::Lazy;
 use protocol::Client;
 use protocol::Test;
 use semver::Version;
@@ -23,7 +24,7 @@ use std::ops::Bound;
 use types::User;
 use types::USER;
 
-static DB: Surreal<Client> = Surreal::init();
+static DB: Lazy<Surreal<Client>> = Lazy::new(Surreal::init);
 
 #[tokio::test]
 async fn api() {
@@ -51,7 +52,7 @@ async fn api() {
 		.unwrap();
 
 	// signin
-	let _: () = DB
+	let _: Jwt = DB
 		.signin(Root {
 			username: "root",
 			password: "root",
@@ -101,12 +102,12 @@ async fn api() {
 		.await
 		.unwrap();
 	let _: QueryResponse = DB
-		.query(BeginStatement)
+		.query(BeginStatement::default())
 		.query("CREATE account:one SET balance = 135605.16")
 		.query("CREATE account:two SET balance = 91031.31")
 		.query("UPDATE account:one SET balance += 300.00")
 		.query("UPDATE account:two SET balance -= 300.00")
-		.query(CommitStatement)
+		.query(CommitStatement::default())
 		.await
 		.unwrap();
 
@@ -136,6 +137,12 @@ async fn api() {
 	let _: Vec<User> =
 		DB.update(USER).range("jane".."john").content(User::default()).await.unwrap();
 	let _: Option<User> = DB.update((USER, "john")).content(User::default()).await.unwrap();
+
+	// insert
+	let _: Vec<User> = DB.insert(USER).await.unwrap();
+	let _: Option<User> = DB.insert((USER, "john")).await.unwrap();
+	let _: Vec<User> = DB.insert(USER).content(User::default()).await.unwrap();
+	let _: Option<User> = DB.insert((USER, "john")).content(User::default()).await.unwrap();
 
 	// merge
 	let _: Vec<User> = DB.update(USER).merge(User::default()).await.unwrap();

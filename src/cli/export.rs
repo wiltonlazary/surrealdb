@@ -1,43 +1,93 @@
-use crate::cli::LOG;
+use crate::cli::abstraction::auth::{CredentialsBuilder, CredentialsLevel};
+use crate::cli::abstraction::{
+	AuthArguments, DatabaseConnectionArguments, DatabaseSelectionArguments,
+};
 use crate::err::Error;
-use surrealdb::engine::any::connect;
-use surrealdb::error::Api as ApiError;
-use surrealdb::opt::auth::Root;
-use surrealdb::Error as SurrealError;
+use clap::Args;
+use futures_util::StreamExt;
+use surrealdb::engine::any::{connect, IntoEndpoint};
+use tokio::io::{self, AsyncWriteExt};
 
-#[tokio::main]
-pub async fn init(matches: &clap::ArgMatches) -> Result<(), Error> {
+#[derive(Args, Debug)]
+pub struct ExportCommandArguments {
+	#[arg(help = "Path to the SurrealQL file to export. Use dash - to write into stdout.")]
+	#[arg(default_value = "-")]
+	#[arg(index = 1)]
+	file: String,
+
+	#[command(flatten)]
+	conn: DatabaseConnectionArguments,
+	#[command(flatten)]
+	auth: AuthArguments,
+	#[command(flatten)]
+	sel: DatabaseSelectionArguments,
+}
+
+pub async fn init(
+	ExportCommandArguments {
+		file,
+		conn: DatabaseConnectionArguments {
+			endpoint,
+		},
+		auth: AuthArguments {
+			username,
+			password,
+			auth_level,
+		},
+		sel: DatabaseSelectionArguments {
+			namespace,
+			database,
+		},
+	}: ExportCommandArguments,
+) -> Result<(), Error> {
 	// Initialize opentelemetry and logging
-	crate::o11y::builder().with_log_level("error").init();
-	// Try to parse the file argument
-	let file = matches.value_of("file").unwrap();
-	// Parse all other cli arguments
-	let username = matches.value_of("user").unwrap();
-	let password = matches.value_of("pass").unwrap();
-	let endpoint = matches.value_of("conn").unwrap();
-	let ns = matches.value_of("ns").unwrap();
-	let db = matches.value_of("db").unwrap();
-	// Connect to the database engine
-	let client = connect(endpoint).await?;
-	// Sign in to the server if the specified database engine supports it
-	let root = Root {
-		username,
-		password,
+	crate::telemetry::builder().with_log_level("error").init();
+
+	// If username and password are specified, and we are connecting to a remote SurrealDB server, then we need to authenticate.
+	// If we are connecting directly to a datastore (i.e. file://local.db or tikv://...), then we don't need to authenticate because we use an embedded (local) SurrealDB instance with auth disabled.
+	let client = if username.is_some()
+		&& password.is_some()
+		&& !endpoint.clone().into_endpoint()?.parse_kind()?.is_local()
+	{
+		debug!("Connecting to the database engine with authentication");
+		let creds = CredentialsBuilder::default()
+			.with_username(username.as_deref())
+			.with_password(password.as_deref())
+			.with_namespace(namespace.as_str())
+			.with_database(database.as_str());
+
+		let client = connect(endpoint).await?;
+
+		debug!("Signing in to the database engine at '{:?}' level", auth_level);
+		match auth_level {
+			CredentialsLevel::Root => client.signin(creds.root()?).await?,
+			CredentialsLevel::Namespace => client.signin(creds.namespace()?).await?,
+			CredentialsLevel::Database => client.signin(creds.database()?).await?,
+		};
+
+		client
+	} else {
+		debug!("Connecting to the database engine without authentication");
+		connect(endpoint).await?
 	};
-	if let Err(error) = client.signin(root).await {
-		match error {
-			// Authentication not supported by this engine, we can safely continue
-			SurrealError::Api(ApiError::AuthNotSupported) => {}
-			error => {
-				return Err(error.into());
-			}
-		}
-	}
+
 	// Use the specified namespace / database
-	client.use_ns(ns).use_db(db).await?;
+	client.use_ns(namespace).use_db(database).await?;
 	// Export the data from the database
-	client.export(file).await?;
-	info!(target: LOG, "The SQL file was exported successfully");
+	debug!("Exporting data from the database");
+	if file == "-" {
+		// Prepare the backup
+		let mut backup = client.export(()).await?;
+		// Get a handle to standard output
+		let mut stdout = io::stdout();
+		// Write the backup to standard output
+		while let Some(bytes) = backup.next().await {
+			stdout.write_all(&bytes?).await?;
+		}
+	} else {
+		client.export(file).await?;
+	}
+	info!("The SurrealQL file was exported successfully");
 	// Everything OK
 	Ok(())
 }

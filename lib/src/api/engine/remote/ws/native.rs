@@ -1,5 +1,5 @@
-use super::LOG;
 use super::PATH;
+use super::{deserialize, serialize};
 use crate::api::conn::Connection;
 use crate::api::conn::DbResponse;
 use crate::api::conn::Method;
@@ -15,10 +15,12 @@ use crate::api::opt::Endpoint;
 #[cfg(any(feature = "native-tls", feature = "rustls"))]
 use crate::api::opt::Tls;
 use crate::api::ExtraFeatures;
+use crate::api::OnceLockExt;
 use crate::api::Result;
 use crate::api::Surreal;
-use crate::engine::remote::ws::IntervalStream;
-use crate::sql::Strand;
+use crate::engine::remote::ws::Data;
+use crate::engine::IntervalStream;
+use crate::opt::WaitFor;
 use crate::sql::Value;
 use flume::Receiver;
 use futures::stream::SplitSink;
@@ -26,8 +28,8 @@ use futures::SinkExt;
 use futures::StreamExt;
 use futures_concurrency::stream::Merge as _;
 use indexmap::IndexMap;
-use once_cell::sync::OnceCell;
-use std::borrow::BorrowMut;
+use revision::revisioned;
+use serde::Deserialize;
 use std::collections::hash_map::Entry;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -38,22 +40,29 @@ use std::mem;
 use std::pin::Pin;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tokio::time;
 use tokio::time::MissedTickBehavior;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::error::Error as WsError;
+use tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::Connector;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
 use trice::Instant;
-use url::Url;
 
 type WsResult<T> = std::result::Result<T, WsError>;
 
 pub(crate) const MAX_MESSAGE_SIZE: usize = 64 << 20; // 64 MiB
 pub(crate) const MAX_FRAME_SIZE: usize = 16 << 20; // 16 MiB
+pub(crate) const WRITE_BUFFER_SIZE: usize = 128000; // tungstenite default
+pub(crate) const MAX_WRITE_BUFFER_SIZE: usize = WRITE_BUFFER_SIZE + MAX_MESSAGE_SIZE; // Recommended max according to tungstenite docs
+pub(crate) const NAGLE_ALG: bool = false;
 
 pub(crate) enum Either {
 	Request(Option<Route>),
@@ -74,16 +83,29 @@ impl From<Tls> for Connector {
 }
 
 pub(crate) async fn connect(
-	url: &Url,
+	endpoint: &Endpoint,
 	config: Option<WebSocketConfig>,
 	#[allow(unused_variables)] maybe_connector: Option<Connector>,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+	let mut request = (&endpoint.url).into_client_request()?;
+
+	if endpoint.supports_revision {
+		request
+			.headers_mut()
+			.insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static(super::REVISION_HEADER));
+	}
+
 	#[cfg(any(feature = "native-tls", feature = "rustls"))]
-	let (socket, _) =
-		tokio_tungstenite::connect_async_tls_with_config(url, config, maybe_connector).await?;
+	let (socket, _) = tokio_tungstenite::connect_async_tls_with_config(
+		request,
+		config,
+		NAGLE_ALG,
+		maybe_connector,
+	)
+	.await?;
 
 	#[cfg(not(any(feature = "native-tls", feature = "rustls")))]
-	let (socket, _) = tokio_tungstenite::connect_async_with_config(url, config).await?;
+	let (socket, _) = tokio_tungstenite::connect_async_with_config(request, config, NAGLE_ALG).await?;
 
 	Ok(socket)
 }
@@ -99,52 +121,50 @@ impl Connection for Client {
 	}
 
 	fn connect(
-		address: Endpoint,
+		mut address: Endpoint,
 		capacity: usize,
 	) -> Pin<Box<dyn Future<Output = Result<Surreal<Self>>> + Send + Sync + 'static>> {
 		Box::pin(async move {
-			let url = address.endpoint.join(PATH)?;
+			address.url = address.url.join(PATH)?;
 			#[cfg(any(feature = "native-tls", feature = "rustls"))]
-			let maybe_connector = address.tls_config.map(Connector::from);
+			let maybe_connector = address.config.tls_config.clone().map(Connector::from);
 			#[cfg(not(any(feature = "native-tls", feature = "rustls")))]
 			let maybe_connector = None;
 
 			let config = WebSocketConfig {
-				max_send_queue: match capacity {
-					0 => None,
-					capacity => Some(capacity),
-				},
 				max_message_size: Some(MAX_MESSAGE_SIZE),
 				max_frame_size: Some(MAX_FRAME_SIZE),
-				accept_unmasked_frames: false,
+				max_write_buffer_size: MAX_WRITE_BUFFER_SIZE,
+				..Default::default()
 			};
 
-			let socket = connect(&url, Some(config), maybe_connector.clone()).await?;
+			let socket = connect(&address, Some(config), maybe_connector.clone()).await?;
 
 			let (route_tx, route_rx) = match capacity {
 				0 => flume::unbounded(),
 				capacity => flume::bounded(capacity),
 			};
 
-			router(url, maybe_connector, capacity, config, socket, route_rx);
+			router(address, maybe_connector, capacity, config, socket, route_rx);
 
 			let mut features = HashSet::new();
-			features.insert(ExtraFeatures::Auth);
+			features.insert(ExtraFeatures::LiveQueries);
 
 			Ok(Surreal {
-				router: OnceCell::with_value(Arc::new(Router {
+				router: Arc::new(OnceLock::with_value(Router {
 					features,
-					conn: PhantomData,
 					sender: route_tx,
 					last_id: AtomicI64::new(0),
 				})),
+				waiter: Arc::new(watch::channel(Some(WaitFor::Connection))),
+				engine: PhantomData,
 			})
 		})
 	}
 
 	fn send<'r>(
 		&'r mut self,
-		router: &'r Router<Self>,
+		router: &'r Router,
 		param: Param,
 	) -> Pin<Box<dyn Future<Output = Result<Receiver<Result<DbResponse>>>> + Send + Sync + 'r>> {
 		Box::pin(async move {
@@ -162,7 +182,7 @@ impl Connection for Client {
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn router(
-	url: Url,
+	endpoint: Endpoint,
 	maybe_connector: Option<Connector>,
 	capacity: usize,
 	config: WebSocketConfig,
@@ -174,9 +194,11 @@ pub(crate) fn router(
 			let mut request = BTreeMap::new();
 			request.insert("method".to_owned(), PING_METHOD.into());
 			let value = Value::from(request);
-			Message::Binary(value.into())
+			let value = serialize(&value, endpoint.supports_revision).unwrap();
+			Message::Binary(value)
 		};
 
+		let mut var_stash = IndexMap::new();
 		let mut vars = IndexMap::new();
 		let mut replay = IndexMap::new();
 
@@ -189,12 +211,11 @@ pub(crate) fn router(
 					0 => HashMap::new(),
 					capacity => HashMap::with_capacity(capacity),
 				};
+				let mut live_queries = HashMap::new();
 
 				let mut interval = time::interval(PING_INTERVAL);
 				// don't bombard the server with pings if we miss some ticks
 				interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-				// Delay sending the first ping
-				interval.tick().await;
 
 				let pinger = IntervalStream::new(interval);
 
@@ -216,19 +237,40 @@ pub(crate) fn router(
 							let (id, method, param) = request;
 							let params = match param.query {
 								Some((query, bindings)) => {
-									vec![query.to_string().into(), bindings.into()]
+									vec![query.into(), bindings.into()]
 								}
 								None => param.other,
 							};
 							match method {
 								Method::Set => {
-									if let [Value::Strand(Strand(key)), value] = &params[..2] {
-										vars.insert(key.clone(), value.clone());
+									if let [Value::Strand(key), value] = &params[..2] {
+										var_stash.insert(id, (key.0.clone(), value.clone()));
 									}
 								}
 								Method::Unset => {
-									if let [Value::Strand(Strand(key))] = &params[..1] {
-										vars.remove(key);
+									if let [Value::Strand(key)] = &params[..1] {
+										vars.swap_remove(&key.0);
+									}
+								}
+								Method::Live => {
+									if let Some(sender) = param.notification_sender {
+										if let [Value::Uuid(id)] = &params[..1] {
+											live_queries.insert(*id, sender);
+										}
+									}
+									if response
+										.into_send_async(Ok(DbResponse::Other(Value::None)))
+										.await
+										.is_err()
+									{
+										trace!("Receiver dropped");
+									}
+									// There is nothing to send to the server here
+									continue;
+								}
+								Method::Kill => {
+									if let [Value::Uuid(id)] = &params[..1] {
+										live_queries.remove(id);
 									}
 								}
 								_ => {}
@@ -245,8 +287,10 @@ pub(crate) fn router(
 									request.insert("params".to_owned(), params.into());
 								}
 								let payload = Value::from(request);
-								trace!(target: LOG, "Request {payload}");
-								Message::Binary(payload.into())
+								trace!("Request {payload}");
+								let payload =
+									serialize(&payload, endpoint.supports_revision).unwrap();
+								Message::Binary(payload)
 							};
 							if let Method::Authenticate
 							| Method::Invalidate
@@ -261,6 +305,7 @@ pub(crate) fn router(
 									last_activity = Instant::now();
 									match routes.entry(id) {
 										Entry::Vacant(entry) => {
+											// Register query route
 											entry.insert((method, response));
 										}
 										Entry::Occupied(..) => {
@@ -270,7 +315,7 @@ pub(crate) fn router(
 												.await
 												.is_err()
 											{
-												trace!(target: LOG, "Receiver dropped");
+												trace!("Receiver dropped");
 											}
 										}
 									}
@@ -278,7 +323,7 @@ pub(crate) fn router(
 								Err(error) => {
 									let error = Error::Ws(error.to_string());
 									if response.into_send_async(Err(error.into())).await.is_err() {
-										trace!(target: LOG, "Receiver dropped");
+										trace!("Receiver dropped");
 									}
 									break;
 								}
@@ -287,38 +332,158 @@ pub(crate) fn router(
 						Either::Response(result) => {
 							last_activity = Instant::now();
 							match result {
-								Ok(message) => match Response::try_from(message) {
-									Ok(option) => {
-										if let Some(response) = option {
-											trace!(target: LOG, "{response:?}");
-											if let Some(Ok(id)) =
-												response.id.map(Value::convert_to_i64)
-											{
-												if let Some((method, sender)) = routes.remove(&id) {
-													let _res = sender
-														.into_send_async(DbResponse::from((
-															method,
-															response.content,
-														)))
-														.await;
+								Ok(message) => {
+									match Response::try_from(&message, endpoint.supports_revision) {
+										Ok(option) => {
+											// We are only interested in responses that are not empty
+											if let Some(response) = option {
+												trace!("{response:?}");
+												match response.id {
+													// If `id` is set this is a normal response
+													Some(id) => {
+														if let Ok(id) = id.coerce_to_i64() {
+															// We can only route responses with IDs
+															if let Some((method, sender)) =
+																routes.remove(&id)
+															{
+																if matches!(method, Method::Set) {
+																	if let Some((key, value)) =
+																		var_stash.swap_remove(&id)
+																	{
+																		vars.insert(key, value);
+																	}
+																}
+																// Send the response back to the caller
+																let mut response = response.result;
+																if matches!(method, Method::Insert)
+																{
+																	// For insert, we need to flatten single responses in an array
+																	if let Ok(Data::Other(
+																		Value::Array(value),
+																	)) = &mut response
+																	{
+																		if let [value] =
+																			&mut value.0[..]
+																		{
+																			response =
+																				Ok(Data::Other(
+																					mem::take(
+																						value,
+																					),
+																				));
+																		}
+																	}
+																}
+																let _res = sender
+																	.into_send_async(
+																		DbResponse::from(response),
+																	)
+																	.await;
+															}
+														}
+													}
+													// If `id` is not set, this may be a live query notification
+													None => match response.result {
+														Ok(Data::Live(notification)) => {
+															let live_query_id = notification.id;
+															// Check if this live query is registered
+															if let Some(sender) =
+																live_queries.get(&live_query_id)
+															{
+																// Send the notification back to the caller or kill live query if the receiver is already dropped
+																if sender
+																	.send(notification)
+																	.await
+																	.is_err()
+																{
+																	live_queries
+																		.remove(&live_query_id);
+																	let kill = {
+																		let mut request =
+																			BTreeMap::new();
+																		request.insert(
+																			"method".to_owned(),
+																			Method::Kill
+																				.as_str()
+																				.into(),
+																		);
+																		request.insert(
+																			"params".to_owned(),
+																			vec![Value::from(
+																				live_query_id,
+																			)]
+																			.into(),
+																		);
+																		let value =
+																			Value::from(request);
+																		let value = serialize(
+																			&value,
+																			endpoint
+																				.supports_revision,
+																		)
+																		.unwrap();
+																		Message::Binary(value)
+																	};
+																	if let Err(error) =
+																		socket_sink.send(kill).await
+																	{
+																		trace!("failed to send kill query to the server; {error:?}");
+																		break;
+																	}
+																}
+															}
+														}
+														Ok(..) => { /* Ignored responses like pings */
+														}
+														Err(error) => error!("{error:?}"),
+													},
+												}
+											}
+										}
+										Err(error) => {
+											#[derive(Deserialize)]
+											#[revisioned(revision = 1)]
+											struct Response {
+												id: Option<Value>,
+											}
+
+											// Let's try to find out the ID of the response that failed to deserialise
+											if let Message::Binary(binary) = message {
+												if let Ok(Response {
+													id,
+												}) = deserialize(
+													&mut &binary[..],
+													endpoint.supports_revision,
+												) {
+													// Return an error if an ID was returned
+													if let Some(Ok(id)) =
+														id.map(Value::coerce_to_i64)
+													{
+														if let Some((_method, sender)) =
+															routes.remove(&id)
+														{
+															let _res = sender
+																.into_send_async(Err(error))
+																.await;
+														}
+													}
+												} else {
+													// Unfortunately, we don't know which response failed to deserialize
+													warn!(
+														"Failed to deserialise message; {error:?}"
+													);
 												}
 											}
 										}
 									}
-									Err(_error) => {
-										trace!(target: LOG, "Failed to deserialise message");
-									}
-								},
+								}
 								Err(error) => {
 									match error {
 										WsError::ConnectionClosed => {
-											trace!(
-												target: LOG,
-												"Connection successfully closed on the server"
-											);
+											trace!("Connection successfully closed on the server");
 										}
 										error => {
-											trace!(target: LOG, "{error}");
+											trace!("{error}");
 										}
 									}
 									break;
@@ -328,14 +493,21 @@ pub(crate) fn router(
 						Either::Ping => {
 							// only ping if we haven't talked to the server recently
 							if last_activity.elapsed() >= PING_INTERVAL {
-								trace!(target: LOG, "Pinging the server");
+								trace!("Pinging the server");
 								if let Err(error) = socket_sink.send(ping.clone()).await {
-									trace!(target: LOG, "failed to ping the server; {error:?}");
+									trace!("failed to ping the server; {error:?}");
 									break;
 								}
 							}
 						}
+						// Close connection request received
 						Either::Request(None) => {
+							match socket_sink.send(Message::Close(None)).await {
+								Ok(..) => trace!("Connection closed successfully"),
+								Err(error) => {
+									warn!("Failed to close database connection; {error}")
+								}
+							}
 							break 'router;
 						}
 					}
@@ -343,18 +515,17 @@ pub(crate) fn router(
 			}
 
 			'reconnect: loop {
-				trace!(target: LOG, "Reconnecting...");
-				match connect(&url, Some(config), maybe_connector.clone()).await {
+				trace!("Reconnecting...");
+				match connect(&endpoint, Some(config), maybe_connector.clone()).await {
 					Ok(s) => {
 						socket = s;
 						for (_, message) in &replay {
 							if let Err(error) = socket.send(message.clone()).await {
-								trace!(target: LOG, "{error}");
+								trace!("{error}");
 								time::sleep(time::Duration::from_secs(1)).await;
 								continue 'reconnect;
 							}
 						}
-						#[cfg(feature = "protocol-ws")]
 						for (key, value) in &vars {
 							let mut request = BTreeMap::new();
 							request.insert("method".to_owned(), Method::Set.as_str().into());
@@ -363,18 +534,18 @@ pub(crate) fn router(
 								vec![key.as_str().into(), value.clone()].into(),
 							);
 							let payload = Value::from(request);
-							trace!(target: LOG, "Request {payload}");
+							trace!("Request {payload}");
 							if let Err(error) = socket.send(Message::Binary(payload.into())).await {
-								trace!(target: LOG, "{error}");
+								trace!("{error}");
 								time::sleep(time::Duration::from_secs(1)).await;
 								continue 'reconnect;
 							}
 						}
-						trace!(target: LOG, "Reconnected successfully");
+						trace!("Reconnected successfully");
 						break;
 					}
 					Err(error) => {
-						trace!(target: LOG, "Failed to reconnect; {error}");
+						trace!("Failed to reconnect; {error}");
 						time::sleep(time::Duration::from_secs(1)).await;
 					}
 				}
@@ -384,33 +555,35 @@ pub(crate) fn router(
 }
 
 impl Response {
-	fn try_from(message: Message) -> Result<Option<Self>> {
+	fn try_from(message: &Message, supports_revision: bool) -> Result<Option<Self>> {
 		match message {
 			Message::Text(text) => {
-				trace!(target: LOG, "Received an unexpected text message; {text}");
+				trace!("Received an unexpected text message; {text}");
 				Ok(None)
 			}
-			Message::Binary(binary) => bung::from_slice(&binary).map(Some).map_err(|error| {
-				Error::ResponseFromBinary {
-					binary,
-					error,
-				}
-				.into()
-			}),
+			Message::Binary(binary) => {
+				deserialize(&mut &binary[..], supports_revision).map(Some).map_err(|error| {
+					Error::ResponseFromBinary {
+						binary: binary.clone(),
+						error: bincode::ErrorKind::Custom(error.to_string()).into(),
+					}
+					.into()
+				})
+			}
 			Message::Ping(..) => {
-				trace!(target: LOG, "Received a ping from the server");
+				trace!("Received a ping from the server");
 				Ok(None)
 			}
 			Message::Pong(..) => {
-				trace!(target: LOG, "Received a pong from the server");
+				trace!("Received a pong from the server");
 				Ok(None)
 			}
 			Message::Frame(..) => {
-				trace!(target: LOG, "Received an unexpected raw frame");
+				trace!("Received an unexpected raw frame");
 				Ok(None)
 			}
 			Message::Close(..) => {
-				trace!(target: LOG, "Received an unexpected close message");
+				trace!("Received an unexpected close message");
 				Ok(None)
 			}
 		}
@@ -418,18 +591,3 @@ impl Response {
 }
 
 pub struct Socket(Option<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>);
-
-impl Drop for Socket {
-	fn drop(&mut self) {
-		if let Some(mut conn) = mem::take(&mut self.0) {
-			futures::executor::block_on(async move {
-				match conn.borrow_mut().close().await {
-					Ok(..) => trace!(target: LOG, "Connection closed successfully"),
-					Err(error) => {
-						trace!(target: LOG, "Failed to close database connection; {error}")
-					}
-				}
-			});
-		}
-	}
-}

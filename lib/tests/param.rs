@@ -1,8 +1,9 @@
 mod parse;
 use parse::Parse;
+mod helpers;
+use helpers::new_ds;
 use surrealdb::dbs::Session;
 use surrealdb::err::Error;
-use surrealdb::kvs::Datastore;
 use surrealdb::sql::Value;
 
 #[tokio::test]
@@ -14,9 +15,9 @@ async fn define_global_param() -> Result<(), Error> {
 		LET $test = 56789;
 		SELECT * FROM $test;
 	";
-	let dbs = Datastore::new("memory").await?;
-	let ses = Session::for_kv().with_ns("test").with_db("test");
-	let res = &mut dbs.execute(&sql, &ses, None, false).await?;
+	let dbs = new_ds().await?;
+	let ses = Session::owner().with_ns("test").with_db("test");
+	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 5);
 	//
 	let tmp = res.remove(0).result;
@@ -25,12 +26,14 @@ async fn define_global_param() -> Result<(), Error> {
 	let tmp = res.remove(0).result?;
 	let val = Value::parse(
 		"{
-			dl: {},
-			dt: {},
-			fc: {},
-			pa: { test: 'DEFINE PARAM $test VALUE 12345' },
-			sc: {},
-			tb: {},
+			analyzers: {},
+			tokens: {},
+			functions: {},
+			models: {},
+			params: { test: 'DEFINE PARAM $test VALUE 12345 PERMISSIONS FULL' },
+			scopes: {},
+			tables: {},
+			users: {},
 		}",
 	);
 	assert_eq!(tmp, val);
@@ -56,9 +59,9 @@ async fn define_protected_param() -> Result<(), Error> {
 		SELECT * FROM $test WHERE some = 'thing';
 		LET $auth = { ID: admin:tester };
 	";
-	let dbs = Datastore::new("memory").await?;
-	let ses = Session::for_kv().with_ns("test").with_db("test");
-	let res = &mut dbs.execute(&sql, &ses, None, false).await?;
+	let dbs = new_ds().await?;
+	let ses = Session::owner().with_ns("test").with_db("test");
+	let res = &mut dbs.execute(sql, &ses, None).await?;
 	assert_eq!(res.len(), 3);
 	//
 	let tmp = res.remove(0).result;
@@ -78,8 +81,24 @@ async fn define_protected_param() -> Result<(), Error> {
 	let tmp = res.remove(0).result;
 	assert!(matches!(
 		tmp.err(),
-		Some(e) if e.to_string() == r#"Found 'auth' but it is not possible to set a variable with this name"#
+		Some(e) if e.to_string() == "'auth' is a protected variable and cannot be set"
 	));
 	//
+	Ok(())
+}
+
+#[tokio::test]
+async fn parameter_outside_database() -> Result<(), Error> {
+	let sql = "RETURN $does_not_exist;";
+	let dbs = new_ds().await?;
+	let ses = Session::owner().with_ns("test");
+	let res = &mut dbs.execute(sql, &ses, None).await?;
+	assert_eq!(res.len(), 1);
+
+	match res.remove(0).result {
+		Err(Error::DbEmpty) => (),
+		_ => panic!("Query should have failed with error: Specify a database to use"),
+	}
+
 	Ok(())
 }
